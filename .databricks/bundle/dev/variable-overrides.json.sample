@@ -1,0 +1,15 @@
+{
+  "//": "Copy this file to variable-overrides.json (same dir) to enable the workspace UI's 'Deploy bundle (dev)' button. Same values you'd put in module.env for CLI deploys — just JSON instead of shell. The CLI honors BUNDLE_VAR_* env vars; the workspace UI honors this file. The actual file is gitignored so each workspace can have its own values.",
+
+  "uc_catalog": "hls_amer_catalog",
+  "uc_schema": "guanyu_chen",
+  "sql_warehouse_id": "18ca4fa4ce58f74c",
+  "lakebase_instance": "lakebasepoc",
+  "hf_secret_scope": "hls_g4",
+
+  "//optional": "all of the below have defaults — uncomment + override as needed",
+  "volume_name": "medical_video",
+  "lakebase_database": "vlm_workbench",
+  "hf_secret_key": "HF_TOKEN",
+  "app_name": "vlm-workbench"
+}
