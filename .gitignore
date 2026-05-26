@@ -26,6 +26,12 @@ chat.md
 # Local dev artifacts
 *.log
 .env
+module.env
+
+# DAB workspace-UI variable overrides — each workspace has its own values
+.databricks/bundle/*/variable-overrides.json
+# (the .sample versions ARE committed; see .databricks/bundle/dev/)
+!.databricks/bundle/*/variable-overrides.json.sample
 
 # Bundled experiments may write Volume paths into local tmp results
 _tmp/
