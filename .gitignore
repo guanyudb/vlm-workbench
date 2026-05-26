@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Node + Vite build output (regenerable via build.sh)
+frontend/node_modules/
+frontend/dist/
+static/assets/
+
+# Claude / vibe session state (not project content)
+.claude/
+chat.md
+
+# Local dev artifacts
+*.log
+.env
+
+# Bundled experiments may write Volume paths into local tmp results
+_tmp/

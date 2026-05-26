@@ -1,0 +1,60 @@
+command:
+  - uvicorn
+  - app:app
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8000"
+
+resources:
+  - name: sql-warehouse
+    sql_warehouse:
+      id: "18ca4fa4ce58f74c"
+      permission: CAN_USE
+  - name: lakebase
+    database:
+      database_name: vlm_workbench
+      instance_name: lakebasepoc
+      permission: CAN_CONNECT_AND_CREATE
+
+env:
+  - name: DATABRICKS_HOST
+    value: "https://fe-vm-hls-amer.cloud.databricks.com/"
+  # mlflow.genai needs the Databricks SDK auth path; this flag lets MLflow
+  # use the SP's M2M OAuth creds instead of trying to mint a legacy token.
+  - name: MLFLOW_ENABLE_DB_SDK
+    value: "1"
+  - name: MLFLOW_TRACKING_URI
+    value: "databricks"
+  - name: MLFLOW_REGISTRY_URI
+    value: "databricks-uc"
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "18ca4fa4ce58f74c"
+  - name: CATALOG
+    value: "hls_amer_catalog"
+  - name: SCHEMA
+    value: "guanyu_chen"
+  - name: VOLUME_PATH
+    value: "/Volumes/hls_amer_catalog/guanyu_chen/medical_video"
+  - name: EXTRACTED_FRAMES_DIR
+    value: "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/extracted_frames"
+  - name: EVAL_FRAMES_DIR
+    value: "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/eval_frames"
+  # Default prompt seeded into the Playground (the GEPA winner from our experiments)
+  - name: DEFAULT_PROMPT
+    value: |
+      Identify the surgical instrument by its visible visual features:
+
+      PROBE vs SHAVER (most common confusion):
+      - probe = thin, narrow solid metal rod, uniform diameter end-to-end, tip may have a tiny hook or blunt end; NO opening, NO rotating head
+      - shaver = wider hollow tube with a distinct rectangular or oval side-opening (aspiration window) near the tip; shaft is noticeably thicker than a probe
+
+      Other instruments:
+      - burr = round/spherical or oval abrasive head at tip
+      - grasper or biter = two metal jaws that open/close at a hinge
+      - anchor_driver = ribbed or screw-threaded shaft
+      - electrocautery = smooth wand with flat, angled, or hook-shaped distal tip
+      - cannula = transparent or yellow plastic hollow tube
+
+      Vocabulary: probe, shaver, burr, grasper, biter, suture_passer, anchor_driver, electrocautery, cannula, scissors, drill_guide, trocar, knot_pusher, rasp, other_metal_tool, no_instrument_visible.
+      Respond with strict JSON: {"instruments": [{"class": "<one of vocab>", "confidence": 0.0-1.0, "evidence": "<short text>"}], "anatomy": "<short text>", "tissue_condition": "<short text>"}
