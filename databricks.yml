@@ -1,0 +1,82 @@
+# Databricks Asset Bundle for the Surgical VLM Workbench.
+#
+# One-line deploy to any workspace:
+#   ./deploy.sh aws    (or azure / gcp)
+#
+# That wrapper creates the secret scope, writes the required secrets, builds
+# the SPA, and runs `databricks bundle deploy -t prod_<cloud>`. The bundle
+# itself wires:
+#   - the Databricks App (frontend + FastAPI backend)
+#   - the UC catalog/schema/volume layout
+#   - the SQL warehouse binding
+#   - the Lakebase database binding
+#   - all referenced notebooks (synced under the bundle root)
+#   - a setup job that runs once after deploy to grant the App SP the right
+#     UC privileges and create the Lakebase Postgres role
+#
+# Variables live in variables.yml. Override per workspace via
+# `module.env` (sourced by deploy.sh) or `--var key=value` on the CLI.
+
+bundle:
+  name: vlm_workbench
+  databricks_cli_version: ">=0.295.*"
+
+include:
+  - variables.yml
+  - resources/*.yml
+  - resources/jobs/*.yml
+
+sync:
+  paths:
+    - .
+  exclude:
+    - frontend/node_modules
+    - "**/__pycache__"
+    - .git
+    - .claude
+    - chat.md
+
+targets:
+  # Local dev — deploys under your personal workspace home, suitable for the
+  # iterate-and-deploy loop. `mode: development` namespaces all resources by
+  # username so multiple devs don't collide.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+      - user_name: ${workspace.current_user.userName}
+        level: CAN_MANAGE
+    run_as:
+      user_name: ${workspace.current_user.userName}
+
+  prod_aws:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${var.current_user}/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+      - user_name: ${var.current_user}
+        level: CAN_MANAGE
+    run_as:
+      user_name: ${var.current_user}
+
+  prod_azure:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${var.current_user}/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+      - user_name: ${var.current_user}
+        level: CAN_MANAGE
+    run_as:
+      user_name: ${var.current_user}
+
+  prod_gcp:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${var.current_user}/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+      - user_name: ${var.current_user}
+        level: CAN_MANAGE
+    run_as:
+      user_name: ${var.current_user}

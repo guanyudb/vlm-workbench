@@ -90,7 +90,9 @@ print(f"[ft] output_dir: {OUTPUT_DIR}")
 # HF token: gives us access to gated repos like Qwen3-VL/MedGemma when
 # transformers wants to validate the tokenizer config against HF.
 try:
-    os.environ["HF_TOKEN"] = dbutils.secrets.get("hls_g4", "HF_TOKEN")
+    hf_scope = cfg.get("hf_secret_scope", "hls_g4")
+    hf_key = cfg.get("hf_secret_key", "HF_TOKEN")
+    os.environ["HF_TOKEN"] = dbutils.secrets.get(hf_scope, hf_key)
 except Exception as e:
     print(f"[ft][warn] HF_TOKEN secret not available: {e}")
 
@@ -412,7 +414,10 @@ with mlflow.start_run(run_name=RUN_ID) as run:
 # Drop a Playground-compatible manifest pointing at the merged-model dir,
 # so the new fine-tuned model appears automatically in Playground's Local
 # section the next time list_local_models polls.
-LOCAL_MODELS_DIR = "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/local_models"
+LOCAL_MODELS_DIR = cfg.get("local_models_dir") or os.environ.get(
+    "LOCAL_MODELS_DIR",
+    "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/local_models",
+)
 manifest_name = UC_MODEL_NAME  # short, sluggable identifier
 manifest_dir = f"{LOCAL_MODELS_DIR}/{manifest_name}"
 os.makedirs(manifest_dir, exist_ok=True)

@@ -1,0 +1,56 @@
+variables:
+  current_user:
+    description: User deploying the bundle (also accepts an SP UPN).
+    default: ${workspace.current_user.userName}
+
+  app_name:
+    description: Name of the Databricks App.
+    default: vlm-workbench
+
+  uc_catalog:
+    description: Unity Catalog where workbench artifacts (volumes, models, prompts, datasets) live.
+
+  uc_schema:
+    description: UC schema inside `uc_catalog`. Created by the bundle if missing.
+
+  volume_name:
+    description: UC managed volume name where videos, frames, model snapshots, and run outputs live.
+    default: medical_video
+
+  sql_warehouse_id:
+    description: ID of a SQL warehouse the App SP can `CAN_USE`. Used for Delta sync.
+
+  lakebase_instance:
+    description: Lakebase Postgres instance name (e.g. `lakebasepoc`).
+
+  lakebase_database:
+    description: Lakebase database name within the instance.
+    default: vlm_workbench
+
+  hf_secret_scope:
+    description: Existing Databricks secret scope holding HF_TOKEN (gated model downloads).
+
+  hf_secret_key:
+    description: Key inside the HF secret scope.
+    default: HF_TOKEN
+
+  mlflow_experiment_path:
+    description: |
+      Workspace path for the MLflow experiment. Defaults to the SP's own home so
+      the App SP always has CAN_MANAGE on it (cross-user ACLs would block a
+      shared path). Override at deploy time if you want a Shared experiment.
+    default: /Users/${var.current_user}/vlmwb-experiments
+
+  workbench_secret_scope:
+    description: Workbench-managed secret scope (catalog/schema config exposed to the App).
+    default: vlmwb_config
+
+  default_admin_group:
+    description: Workspace group that gets MANAGE on workbench resources.
+    default: admins
+
+  common_resource_tags:
+    description: Tags applied to every job + resource the bundle creates.
+    default:
+      application: vlm-workbench
+      created_by: ${workspace.current_user.short_name}

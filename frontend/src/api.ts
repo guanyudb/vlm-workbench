@@ -341,6 +341,14 @@ export const api = {
     fetch(`/api/labels?frame_path=${encodeURIComponent(frame_path)}`, { method: "DELETE" })
       .then(asJson<{ deleted: number }>),
 
+  setupCheck: () =>
+    fetch("/api/setup/check").then(asJson<{
+      checks: { name: string; ok: boolean; detail: string; remediation: string | null; docs_url: string | null }[];
+      n_ok: number;
+      n_total: number;
+      ready: boolean;
+    }>),
+
   labelsStats: () =>
     fetch("/api/labels/stats").then(asJson<{ total: number; by_instrument: { instrument: string; n: number }[] }>),
 

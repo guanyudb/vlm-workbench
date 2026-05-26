@@ -17,11 +17,17 @@ import time
 import yaml
 from pathlib import Path
 
-LOCAL_MODELS_DIR = "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/local_models"
-
+dbutils.widgets.text("local_models_dir", "", "Absolute path under a UC Volume — defaults to env LOCAL_MODELS_DIR")
 dbutils.widgets.text("hf_token", "", "HF token override (else read from secret)")
 dbutils.widgets.text("hf_secret_scope", "hls_g4", "Databricks secret scope")
 dbutils.widgets.text("hf_secret_key", "HF_TOKEN", "Databricks secret key")
+
+LOCAL_MODELS_DIR = (
+    dbutils.widgets.get("local_models_dir").strip()
+    or os.environ.get("LOCAL_MODELS_DIR")
+    or "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/local_models"
+)
+print(f"[setup_cache] LOCAL_MODELS_DIR={LOCAL_MODELS_DIR}")
 
 # Prefer the widget override; fall back to dbutils.secrets so the job can run
 # unattended on a schedule. The token unlocks gated repos like

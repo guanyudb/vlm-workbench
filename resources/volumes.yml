@@ -1,0 +1,12 @@
+resources:
+  volumes:
+    # The single data volume the workbench uses for everything in flight:
+    # videos/inbox/, images/<batch>/, extracted_frames/, eval_frames/,
+    # local_models/, optimizer_runs/, finetune_runs/, local_runs/,
+    # ingest_runs/, studio_analyses/, _surgical_vlm_test/, _mlflow_genai_verify/.
+    medical_video:
+      catalog_name: ${var.uc_catalog}
+      schema_name: ${var.uc_schema}
+      name: ${var.volume_name}
+      volume_type: MANAGED
+      comment: "Workbench data volume — videos, frames, model snapshots, run outputs."

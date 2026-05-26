@@ -12,9 +12,10 @@ import LabelTab from "@/Label";
 import Train from "@/Train";
 import VideosTab from "@/Videos";
 import Deploy from "@/Deploy";
+import Setup from "@/Setup";
 import { cn } from "@/lib/utils";
 
-const PHASE2 = ["library", "compare", "label", "train", "deploy", "videos", "eval", "jobs", "agent", "settings"] as const;
+const PHASE2 = ["library", "compare", "label", "train", "deploy", "videos", "setup", "eval", "jobs", "agent", "settings"] as const;
 type Route = "playground" | "studio" | (typeof PHASE2)[number];
 
 const ROUTES: { id: Route; label: string; icon: any; available: boolean }[] = [
@@ -25,11 +26,11 @@ const ROUTES: { id: Route; label: string; icon: any; available: boolean }[] = [
   { id: "deploy", label: "Deploy", icon: Rocket, available: true },
   { id: "studio", label: "Studio", icon: Film, available: true },
   { id: "compare", label: "Compare", icon: BarChart3, available: true },
+  { id: "setup", label: "Setup", icon: Settings, available: true },
   { id: "library", label: "Library", icon: BookOpen, available: false },
   { id: "eval", label: "Eval", icon: Wrench, available: false },
   { id: "jobs", label: "Jobs", icon: Briefcase, available: false },
   { id: "agent", label: "Agent", icon: MessageSquare, available: false },
-  { id: "settings", label: "Settings", icon: Settings, available: false },
 ];
 
 export default function App() {
@@ -47,7 +48,7 @@ const ROUTE_KEY = "vlmwb.route.v1";
 function Main() {
   const [route, setRoute] = useState<Route>(() => {
     const saved = localStorage.getItem(ROUTE_KEY);
-    const valid = ["playground", "studio", "compare", "label", "train", "videos", "deploy"];
+    const valid = ["playground", "studio", "compare", "label", "train", "videos", "deploy", "setup"];
     if (saved && valid.includes(saved)) return saved as Route;
     return "playground";
   });
@@ -172,7 +173,12 @@ function Main() {
               <Deploy />
             </div>
           )}
-          {route !== "playground" && route !== "studio" && route !== "compare" && route !== "label" && route !== "train" && route !== "videos" && route !== "deploy" && <Placeholder route={route} />}
+          {mounted.has("setup") && (
+            <div className={cn(route === "setup" ? "block" : "hidden")}>
+              <Setup />
+            </div>
+          )}
+          {route !== "playground" && route !== "studio" && route !== "compare" && route !== "label" && route !== "train" && route !== "videos" && route !== "deploy" && route !== "setup" && <Placeholder route={route} />}
         </main>
       </div>
     </div>

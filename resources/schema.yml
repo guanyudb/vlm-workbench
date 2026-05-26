@@ -1,0 +1,11 @@
+resources:
+  # Create the UC schema inside the existing catalog. The catalog itself is
+  # NOT created by the bundle — we expect it to already exist (most workspaces
+  # have a curated catalog + RBAC pattern that's owner-managed). If you want
+  # the catalog created too, add a `catalogs:` resource here, but be aware
+  # most orgs lock down catalog creation.
+  schemas:
+    workbench_schema:
+      catalog_name: ${var.uc_catalog}
+      name: ${var.uc_schema}
+      comment: Surgical VLM Workbench managed schema (labels, snapshots, models, prompts, datasets).

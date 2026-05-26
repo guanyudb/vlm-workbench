@@ -260,7 +260,12 @@ class TaskModel:
 
     def _load_hf(self):
         from transformers import AutoProcessor, AutoModelForImageTextToText, AutoModelForCausalLM, AutoTokenizer
-        os.environ["HF_TOKEN"] = dbutils.secrets.get("hls_g4", "HF_TOKEN")
+        # HF token: scope/key configurable via YAML so a different workspace
+        # can ship without editing the notebook source. Defaults preserved for
+        # backwards compatibility with the original deploy.
+        _hf_scope = (_cfg.get("hf_secret_scope") if "_cfg" in dir() else None) or "hls_g4"
+        _hf_key = (_cfg.get("hf_secret_key") if "_cfg" in dir() else None) or "HF_TOKEN"
+        os.environ["HF_TOKEN"] = dbutils.secrets.get(_hf_scope, _hf_key)
         print(f"Loading {self.cfg['model_id']}...")
         if self.modality == "image":
             self.processor = AutoProcessor.from_pretrained(self.cfg["model_id"], token=os.environ["HF_TOKEN"])

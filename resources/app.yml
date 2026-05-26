@@ -1,0 +1,49 @@
+# The Databricks App definition. The app source code lives at the bundle root
+# (source_code_path: ..) — same layout the current dev workflow uses. The
+# bundle just adds programmatic resource bindings so a fresh workspace gets
+# everything wired in one `bundle deploy`.
+resources:
+  apps:
+    vlm_workbench_app:
+      name: ${var.app_name}
+      description: "Surgical VLM Workbench — multi-tab Databricks App for VLM experimentation"
+      source_code_path: ..
+
+      resources:
+        - name: sql_warehouse
+          sql_warehouse:
+            id: ${var.sql_warehouse_id}
+            permission: CAN_USE
+
+        - name: lakebase
+          database:
+            database_name: ${var.lakebase_database}
+            instance_name: ${var.lakebase_instance}
+            permission: CAN_CONNECT_AND_CREATE
+
+        # Catalog + schema knobs exposed as secrets so the App reads them via
+        # /Volumes/... env vars rather than hardcoding. Same pattern as
+        # genesis-workbench's core_catalog_name / core_schema_name secrets.
+        - name: uc_catalog
+          secret:
+            key: uc_catalog
+            scope: ${var.workbench_secret_scope}
+            permission: READ
+
+        - name: uc_schema
+          secret:
+            key: uc_schema
+            scope: ${var.workbench_secret_scope}
+            permission: READ
+
+        - name: volume_name
+          secret:
+            key: volume_name
+            scope: ${var.workbench_secret_scope}
+            permission: READ
+
+        - name: hf_token
+          secret:
+            key: ${var.hf_secret_key}
+            scope: ${var.hf_secret_scope}
+            permission: READ

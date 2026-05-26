@@ -17,7 +17,7 @@ venv/
 # Node + Vite build output (regenerable via build.sh)
 frontend/node_modules/
 frontend/dist/
-static/assets/
+static/
 
 # Claude / vibe session state (not project content)
 .claude/

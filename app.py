@@ -277,6 +277,273 @@ def debug_mlflow():
     return out
 
 
+# ── Setup preflight ─────────────────────────────────────────────────────
+#
+# Runs every check the app needs to function end-to-end. Used by the Setup
+# tab so a new deploy can see what's working / broken in one place, with
+# remediations inline.
+
+class SetupCheck(BaseModel):
+    name: str
+    ok: bool
+    detail: str = ""
+    remediation: Optional[str] = None
+    docs_url: Optional[str] = None
+
+
+@app.get("/api/setup/check")
+def setup_check():
+    checks: List[SetupCheck] = []
+
+    # 1. Workspace SDK / M2M OAuth
+    try:
+        w = _workspace()
+        host = w.config.host
+        checks.append(SetupCheck(
+            name="Workspace credentials",
+            ok=True,
+            detail=f"connected to {host}",
+        ))
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="Workspace credentials",
+            ok=False,
+            detail=str(e)[:200],
+            remediation="The app's service principal needs DATABRICKS_CLIENT_ID/SECRET injected via the App's resource bindings. Re-deploy via the bundle.",
+        ))
+
+    # 2. Lakebase reachable + labels table present
+    try:
+        if not _lakebase_available():
+            raise RuntimeError("DATABRICKS_CLIENT_ID/SECRET not set — app SP can't mint a Postgres token")
+        _ensure_labels_table()
+        with _pg_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM frame_labels")
+            n_labels = cur.fetchone()[0]
+        checks.append(SetupCheck(
+            name="Lakebase Postgres",
+            ok=True,
+            detail=f"connected · frame_labels rows: {n_labels}",
+        ))
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="Lakebase Postgres",
+            ok=False,
+            detail=str(e)[:240],
+            remediation=(
+                "1. Confirm the App is bound to a Lakebase database in app.yaml. "
+                "2. Run the postdeploy job to create a Postgres role for the App SP "
+                f"({os.environ.get('DATABRICKS_CLIENT_ID','<sp-id>')})."
+            ),
+        ))
+
+    # 3. SQL warehouse — used for Delta sync. PENDING is a benign warming
+    # state (a cold warehouse needs ~30-60s to spin up); only treat actual
+    # FAILED/CANCELED states as a real failure.
+    try:
+        wh_id = os.environ.get("DATABRICKS_WAREHOUSE_ID")
+        if not wh_id:
+            raise RuntimeError("DATABRICKS_WAREHOUSE_ID not set")
+        w = _workspace()
+        resp = w.api_client.do(
+            "POST", "/api/2.0/sql/statements",
+            body={"warehouse_id": wh_id, "statement": "SELECT 1", "wait_timeout": "10s"},
+        )
+        state = (resp.get("status") or {}).get("state")
+        if state in ("SUCCEEDED", "PENDING", "RUNNING"):
+            detail = (f"warehouse {wh_id} ready"
+                      if state == "SUCCEEDED" else f"warehouse {wh_id} warming ({state})")
+            checks.append(SetupCheck(name="SQL warehouse", ok=True, detail=detail))
+        else:
+            raise RuntimeError(f"SELECT 1 returned state={state}")
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="SQL warehouse",
+            ok=False,
+            detail=str(e)[:240],
+            remediation="Bind a SQL warehouse via app.yaml `resources.sql_warehouse.permission: CAN_USE`. The bundle does this automatically.",
+        ))
+
+    # 4. UC volume — verify the data volume exists and is readable
+    try:
+        items = _ls_dir(VOLUME_PATH)
+        n = sum(1 for _ in items)
+        checks.append(SetupCheck(
+            name="UC data volume",
+            ok=True,
+            detail=f"{VOLUME_PATH} · {n} items",
+        ))
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="UC data volume",
+            ok=False,
+            detail=f"{VOLUME_PATH}: {str(e)[:200]}",
+            remediation=(
+                "1. Run `bundle deploy` — the bundle creates the managed volume. "
+                "2. Confirm the SP has READ/WRITE VOLUME (the postdeploy job grants this)."
+            ),
+        ))
+
+    # 5. Local models cache
+    try:
+        local_models = list_local_models()
+        ready = [m for m in local_models if m.ready]
+        all_count = len(local_models)
+        checks.append(SetupCheck(
+            name="Local model cache",
+            ok=len(ready) > 0,
+            detail=f"{len(ready)} ready of {all_count} (in {LOCAL_MODELS_DIR})",
+            remediation=(
+                "Run the `setup_cache` notebook with `hf_token` widget set (or with the "
+                "hls_g4/HF_TOKEN secret accessible). It snapshots weights from HF into "
+                "the Volume."
+            ) if len(ready) == 0 else None,
+        ))
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="Local model cache",
+            ok=False,
+            detail=str(e)[:200],
+        ))
+
+    # 6. HF token secret — needed for gated model downloads (MedGemma, MedGemma-cataract)
+    try:
+        w = _workspace()
+        scopes = [s.name for s in w.secrets.list_scopes()]
+        # Take a best-guess: the workbench app passes hf_secret_scope as a binding,
+        # but at runtime we don't have direct access to its name. The notebooks
+        # default to `hls_g4`. Probe that, plus any with `hf` in the name.
+        candidates = ["hls_g4"] + [s for s in scopes if "hf" in s.lower()]
+        candidates = list(dict.fromkeys(candidates))
+        found = [s for s in candidates if s in scopes]
+        if not found:
+            raise RuntimeError(f"no HF scope candidate visible (looked for: {candidates})")
+        # Probe ACL — we want to know if SP has READ
+        sp = os.environ.get("DATABRICKS_CLIENT_ID")
+        if sp:
+            try:
+                acls = w.secrets.list_acls(scope=found[0])
+                sp_acl = next((a for a in acls if a.principal == sp), None)
+                if sp_acl:
+                    detail = f"scope `{found[0]}` · SP has {sp_acl.permission}"
+                else:
+                    raise RuntimeError(f"App SP not in ACL of scope `{found[0]}`")
+            except Exception as inner:
+                # ACL lookup needs MANAGE on the scope; fall back to existence-only
+                detail = f"scope `{found[0]}` exists (ACL probe: {str(inner)[:100]})"
+        else:
+            detail = f"scope `{found[0]}` exists"
+        checks.append(SetupCheck(
+            name="HuggingFace token secret",
+            ok=True,
+            detail=detail,
+        ))
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="HuggingFace token secret",
+            ok=False,
+            detail=str(e)[:200],
+            remediation=(
+                "1. `databricks secrets create-scope hls_g4` (or whatever scope name) "
+                "2. `databricks secrets put-secret hls_g4 HF_TOKEN` (paste your HF token) "
+                "3. `databricks secrets put-acl hls_g4 <SP_ID> READ`."
+            ),
+        ))
+
+    # 7. Bundled notebooks — actively import each into the SP home (idempotent).
+    # That's what real Playground/Train/Optimize calls do anyway, and it's the
+    # only way to verify the source files are actually present in the deploy.
+    notebook_resolvers = [
+        ("optimizer/gepa", lambda: _resolve_optimizer_notebook("gepa")),
+        ("optimizer/dspy", lambda: _resolve_optimizer_notebook("dspy")),
+        ("local_inference/run", _resolve_local_inference_notebook),
+        ("local_inference/finetune", _resolve_finetune_notebook),
+        ("ingest/smart_frames", _resolve_ingest_notebook),
+    ]
+    missing: List[str] = []
+    for name, resolver in notebook_resolvers:
+        try:
+            resolver()
+        except Exception as e:
+            missing.append(f"{name}: {str(e)[:80]}")
+    if missing:
+        checks.append(SetupCheck(
+            name="Bundled notebooks",
+            ok=False,
+            detail=f"{len(missing)} of {len(notebook_resolvers)} fail to resolve",
+            remediation=(
+                "Each bundled notebook should be present in the App's deployed source tree. "
+                "Run `databricks apps deploy` from a fresh build; the bundle's sync.paths "
+                "copies everything under the source root.\n\nFailures:\n  - "
+                + "\n  - ".join(missing)
+            ),
+        ))
+    else:
+        checks.append(SetupCheck(
+            name="Bundled notebooks",
+            ok=True,
+            detail=f"{len(notebook_resolvers)}/{len(notebook_resolvers)} resolve cleanly",
+        ))
+
+    # 8. MLflow GenAI auth path (UC-managed prompts/datasets)
+    try:
+        with _mlflow_auth_scope():
+            import mlflow
+            mlflow.set_tracking_uri("databricks")
+            mlflow.set_registry_uri("databricks-uc")
+            mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
+            # Try a no-op load on the canonical prompt name — if perm denied,
+            # we'll learn here
+            try:
+                mlflow.genai.load_prompt(f"prompts:/{GENAI_PROMPT_NAME}/1")
+                detail = f"prompt `{GENAI_PROMPT_NAME}` v1 readable"
+            except Exception:
+                # Try the actual permission check by attempting to register a
+                # throwaway version we won't keep — but only if the schema name
+                # matches the configured one (otherwise we're just polluting
+                # the user's schema)
+                try:
+                    p = mlflow.genai.register_prompt(
+                        name=GENAI_PROMPT_NAME,
+                        template="PREFLIGHT probe — safe to delete",
+                        commit_message="preflight check",
+                    )
+                    detail = f"register works (v{p.version})"
+                except Exception as ex_inner:
+                    if "permission" in str(ex_inner).lower():
+                        raise RuntimeError(
+                            "App SP can register prompts via MLflow but UC blocks it: "
+                            f"{str(ex_inner)[:200]}"
+                        )
+                    raise
+        checks.append(SetupCheck(
+            name="MLflow GenAI prompts (UC)",
+            ok=True,
+            detail=detail,
+        ))
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="MLflow GenAI prompts (UC)",
+            ok=False,
+            detail=str(e)[:240],
+            remediation=(
+                "UC-managed MLflow prompts have a permission gate that ALL PRIVILEGES "
+                "on the schema doesn't cover. Add the App SP as a schema co-owner via "
+                "the UC UI (Catalog Explorer → Permissions → grant CAN_MANAGE), or run "
+                "prompt registration from a notebook executing as a user with schema "
+                "ownership."
+            ),
+        ))
+
+    n_ok = sum(1 for c in checks if c.ok)
+    return {
+        "checks": [c.model_dump() for c in checks],
+        "n_ok": n_ok,
+        "n_total": len(checks),
+        "ready": n_ok == len(checks),
+    }
+
+
 @app.get("/api/debug/env")
 def debug_env():
     """List which Lakebase-related env vars exist (presence only, not values)."""
@@ -762,6 +1029,12 @@ LOCAL_RUNS_DIR = os.environ.get(
     "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/local_runs",
 )
 
+# HF secret scope/key the bundled notebooks read via dbutils.secrets.get.
+# Threaded into every YAML config so the notebooks don't need to know which
+# scope holds the token in *this* workspace.
+HF_SECRET_SCOPE = os.environ.get("HF_SECRET_SCOPE", "hls_g4")
+HF_SECRET_KEY = os.environ.get("HF_SECRET_KEY", "HF_TOKEN")
+
 
 def _resolve_local_inference_notebook() -> str:
     """Bundled inference notebook → SP-home as a real notebook."""
@@ -905,6 +1178,10 @@ def submit_local_run(req: LocalRunRequest):
         "prompt": req.prompt,
         "frame_paths": req.frame_paths,
         "output_dir": out_dir,
+        # Threaded so the notebook stays workspace-agnostic
+        "hf_secret_scope": HF_SECRET_SCOPE,
+        "hf_secret_key": HF_SECRET_KEY,
+        "local_models_dir": LOCAL_MODELS_DIR,
     }
     yaml_text = yaml.safe_dump(cfg, default_flow_style=False, allow_unicode=True)
     w = _workspace()
@@ -1155,6 +1432,10 @@ def kick_off_finetune(req: FineTuneRequest):
         "output_dir": out_dir,
         "training_data": training_data,
         "train_prompt": (req.train_prompt or "").strip() or DEFAULT_FT_PROMPT,
+        # Workspace-specific knobs threaded through so the notebook stays portable
+        "hf_secret_scope": HF_SECRET_SCOPE,
+        "hf_secret_key": HF_SECRET_KEY,
+        "local_models_dir": LOCAL_MODELS_DIR,
         "lora": {"r": req.lora_r, "alpha": req.lora_alpha, "dropout": 0.05},
         "training": {
             "num_epochs": req.num_epochs,
@@ -1883,6 +2164,9 @@ def kick_off_optimize(req: OptimizeRequest):
 
     cfg: Dict[str, object] = {
         "output_dir": out_dir,
+        # Workspace-specific knobs the bundled notebook reads via _cfg.get(...)
+        "hf_secret_scope": HF_SECRET_SCOPE,
+        "hf_secret_key": HF_SECRET_KEY,
         "task": {
             "name": run_id,
             "description": "Prompt optimization for arthroscopy instrument ID",

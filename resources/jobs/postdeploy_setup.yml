@@ -1,0 +1,33 @@
+resources:
+  jobs:
+    # One-shot setup job: runs after a fresh bundle deploy to wire up
+    # everything the App SP needs but DAB can't express directly:
+    #   - GRANT USE CATALOG/SCHEMA + CREATE TABLE/MODEL/FUNCTION + MODIFY/SELECT/EXECUTE
+    #     on the workbench schema to the App SP
+    #   - Create the Postgres role in Lakebase for the App SP
+    #   - Grant READ on the HF token secret scope to the App SP
+    #   - Sanity-ping every notebook the App references so we know they imported cleanly
+    vlmwb_postdeploy_setup:
+      name: vlmwb_postdeploy_setup
+      tasks:
+        - task_key: setup
+          notebook_task:
+            notebook_path: ../../setup/postdeploy.py
+            source: WORKSPACE
+            base_parameters:
+              uc_catalog: ${var.uc_catalog}
+              uc_schema: ${var.uc_schema}
+              volume_name: ${var.volume_name}
+              app_name: ${var.app_name}
+              lakebase_instance: ${var.lakebase_instance}
+              lakebase_database: ${var.lakebase_database}
+              workbench_secret_scope: ${var.workbench_secret_scope}
+              hf_secret_scope: ${var.hf_secret_scope}
+          environment_key: cpu_env
+      queue:
+        enabled: true
+      environments:
+        - environment_key: cpu_env
+          spec:
+            environment_version: "5"
+      tags: ${var.common_resource_tags}
