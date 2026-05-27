@@ -130,6 +130,15 @@ export default function Playground({
     "vlmwb.pg.selectedLocalModels", new Set(), setStringCodec,
   );
   const [prompt, setPrompt] = usePersistentState<string>("vlmwb.pg.prompt", DEFAULT_PROMPT);
+  // Live workspace default — replaces the locally-inlined DEFAULT_PROMPT
+  // when /api/task-config is reachable. Used by the "Reset" button so it
+  // restores the workspace's current task config, not an old code constant.
+  const [workspaceDefaultPrompt, setWorkspaceDefaultPrompt] = useState<string>(DEFAULT_PROMPT);
+  useEffect(() => {
+    api.getTaskConfig()
+      .then((c) => { if (c.rendered_prompt) setWorkspaceDefaultPrompt(c.rendered_prompt); })
+      .catch(() => { /* keep code-constant fallback */ });
+  }, []);
   // Frame preview / lightbox
   const [previewIdx, setPreviewIdx] = useState<number | null>(null);
 
@@ -969,7 +978,7 @@ export default function Playground({
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-base">Prompt</CardTitle>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" size="sm" onClick={() => setPrompt(DEFAULT_PROMPT)}>
+              <Button variant="ghost" size="sm" onClick={() => setPrompt(workspaceDefaultPrompt)}>
                 Reset to default
               </Button>
             </div>

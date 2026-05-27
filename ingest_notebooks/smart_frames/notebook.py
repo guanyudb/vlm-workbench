@@ -48,16 +48,54 @@ OUTPUT_DIR = cfg["output_dir"]
 PG_HOST = cfg["pg_host"]
 PG_DBNAME = cfg["pg_dbname"]
 PG_USER = cfg["pg_user"]
-PG_PASSWORD = cfg["pg_password"]
 PG_PORT = int(cfg.get("pg_port", 5432))
 CANDIDATE_FPS = float(cfg.get("candidate_fps", 1.0))
 MAX_FRAMES = int(cfg.get("max_frames", 40))
+# Lakebase endpoint path — used by the notebook to mint its OWN Postgres
+# token via /api/2.0/postgres/credentials. We deliberately do NOT accept a
+# pre-minted password from the caller anymore: writing a bearer to a
+# Volume-stored YAML leaks it to any reader with READ VOLUME, and tokens
+# live ~1h.
+PG_ENDPOINT = cfg.get("pg_endpoint", "")  # e.g. projects/vlm/branches/production/endpoints/primary
+PG_INSTANCE = cfg.get("pg_instance", "")  # for legacy Provisioned fallback
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 print(f"[ingest] video={VIDEO_NAME} video_id={VIDEO_ID}")
 print(f"[ingest] output={OUTPUT_DIR}  candidate_fps={CANDIDATE_FPS}  max_frames={MAX_FRAMES}")
 
 # COMMAND ----------
+# Mint a fresh Lakebase Postgres token using THIS notebook's identity (which
+# is the App SP for SP-submitted runs). Tokens live ~1h, so we mint once at
+# the top of the notebook — long-running extractions may need a refresh
+# helper if they exceed that, but the smart-frame pipeline is typically <5min.
+from databricks.sdk import WorkspaceClient
+_sdk = WorkspaceClient()
+
+def _mint_pg_token() -> str:
+    # Try Project API first
+    if PG_ENDPOINT:
+        try:
+            r = _sdk.api_client.do("POST", "/api/2.0/postgres/credentials",
+                                   body={"endpoint": PG_ENDPOINT})
+            t = (r or {}).get("token")
+            if t: return t
+        except Exception as e:
+            print(f"[ingest] project credential mint failed: {e}")
+    # Provisioned fallback
+    if PG_INSTANCE:
+        try:
+            import uuid as _uuid
+            r = _sdk.api_client.do("POST", "/api/2.0/database/credentials/generate",
+                                   body={"instance_names": [PG_INSTANCE],
+                                         "request_id": str(_uuid.uuid4())})
+            t = (r or {}).get("token")
+            if t: return t
+        except Exception as e:
+            print(f"[ingest] instance credential mint failed: {e}")
+    raise SystemExit("could not mint Lakebase token (pg_endpoint and pg_instance both unset)")
+
+PG_PASSWORD = _mint_pg_token()
+
 # Connect to Lakebase to update video status + register frames
 import psycopg
 
@@ -173,8 +211,10 @@ try:
     selected.sort(key=lambda x: x["timestamp_s"])
     print(f"[ingest] selected {len(selected)} smart frames")
 
-    # COMMAND ----------
     # Write JPGs + register each frame in Lakebase
+    # (note: cannot use `# COMMAND ----------` mid-try — Databricks treats
+    # any line matching that pattern as a cell separator, splitting the
+    # try/except across cells and producing a SyntaxError on the first half)
     video_stem = Path(VIDEO_NAME).stem
     frame_rows = []
     for c in selected:
@@ -221,15 +261,20 @@ try:
 
     elapsed = time.time() - t0
     _set_video_status("ready", f"extracted {len(frame_rows)} frames in {elapsed:.0f}s", n_frames=len(frame_rows))
-    dbutils.notebook.exit(json.dumps({
+    _exit_payload = json.dumps({
         "video_id": VIDEO_ID,
         "n_frames": len(frame_rows),
         "elapsed_s": elapsed,
         "status": "ready",
-    }))
+    })
 
 except Exception as e:
+    # `dbutils.notebook.exit()` raises an exception itself, so it has to
+    # live OUTSIDE the try — otherwise the normal happy-path exit gets
+    # caught here and overwrites status='ready' with status='error'.
     tb = traceback.format_exc()
     print(f"[ingest][error] {e}\n{tb}")
     _set_video_status("error", str(e)[:300])
     raise
+else:
+    dbutils.notebook.exit(_exit_payload)

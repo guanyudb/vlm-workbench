@@ -33,7 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -46,7 +46,26 @@ log = logging.getLogger("vlm-workbench")
 app = FastAPI(title="Surgical VLM Workbench")
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-VOLUME_PATH = os.environ.get("VOLUME_PATH", "/Volumes/hls_amer_catalog/guanyu_chen/medical_video")
+
+# Databricks Apps' runtime sets DATABRICKS_HOST to a bare hostname (no
+# scheme). Mlflow/SDK code paths that build URLs by string concat then
+# produce schemeless URLs and `requests` raises `MissingSchema`. Normalize
+# once at boot so every downstream consumer sees a fully-qualified URL.
+_dh = os.environ.get("DATABRICKS_HOST", "").strip()
+if _dh and not _dh.startswith(("http://", "https://")):
+    os.environ["DATABRICKS_HOST"] = "https://" + _dh.lstrip("/")
+
+# UC layout — sourced via DAB secret bindings (UC_CATALOG/UC_SCHEMA/VOLUME_NAME)
+# so a fresh workspace deploys without editing the source. We accept the
+# pre-DAB env var names (CATALOG/SCHEMA, hardcoded VOLUME_PATH) as fallbacks
+# so existing prod deploys keep working until they migrate to the bundle.
+UC_CATALOG_BOOT = os.environ.get("UC_CATALOG") or os.environ.get("CATALOG") or "hls_amer_catalog"
+UC_SCHEMA_BOOT = os.environ.get("UC_SCHEMA") or os.environ.get("SCHEMA") or "guanyu_chen"
+VOLUME_NAME_BOOT = os.environ.get("VOLUME_NAME", "medical_video")
+VOLUME_PATH = os.environ.get(
+    "VOLUME_PATH",
+    f"/Volumes/{UC_CATALOG_BOOT}/{UC_SCHEMA_BOOT}/{VOLUME_NAME_BOOT}",
+)
 EXTRACTED_FRAMES_DIR = os.environ.get(
     "EXTRACTED_FRAMES_DIR",
     os.path.join(VOLUME_PATH, "extracted_frames"),
@@ -59,10 +78,184 @@ STUDIO_CACHE_DIR = os.environ.get(
     "STUDIO_CACHE_DIR",
     os.path.join(VOLUME_PATH, "studio_analyses"),
 )
-DEFAULT_PROMPT = os.environ.get(
-    "DEFAULT_PROMPT",
-    "Identify the surgical instrument visible in this arthroscopy frame.",
-)
+# ── Task configuration (vocabulary + output schema + prompt template) ────
+#
+# All workbench task semantics live in one editable JSON file on the Volume:
+#   <VOLUME_PATH>/config/task_config.json
+#
+# Single source of truth — replaces the five places that used to hardcode
+# the instrument vocabulary (Playground.tsx, Label.tsx, app.yaml's
+# DEFAULT_PROMPT, the optimizer's vocab seed, and Studio's per-frame prompt).
+# Setup tab edits this; Playground reads `rendered_prompt`; Label reads
+# `vocabulary`; snapshots embed the active config at save-time.
+TASK_CONFIG_PATH = f"{VOLUME_PATH}/config/task_config.json"
+
+_DEFAULT_TASK_CONFIG: Dict[str, object] = {
+    "vocabulary": [
+        "probe", "shaver", "burr", "grasper", "biter", "suture_passer",
+        "anchor_driver", "electrocautery", "cannula", "scissors",
+        "drill_guide", "trocar", "knot_pusher", "rasp", "other_metal_tool",
+        "no_instrument_visible",
+    ],
+    # response_schema declares (a) the JSON shape the LLM is told to return,
+    # and (b) the JSONPath-ish lenses every UI uses to extract fields from
+    # the parsed response. Editing this is the supported way to change the
+    # response contract without touching code.
+    "response_schema": {
+        "shape": {
+            "instruments": [
+                {"class": "<one of vocab>", "confidence": 0.0, "evidence": "<short text>"}
+            ],
+            "anatomy": "<short text>",
+            "tissue_condition": "<short text>",
+        },
+        "primary_class_path": "instruments[0].class",
+        "evidence_path": "instruments[0].evidence",
+        "confidence_path": "instruments[0].confidence",
+        "aux_fields": [
+            {"path": "anatomy", "label": "Anatomy"},
+            {"path": "tissue_condition", "label": "Tissue condition"},
+        ],
+    },
+    "prompt_template": (
+        "Identify the surgical instrument by its visible visual features:\n\n"
+        "PROBE vs SHAVER (most common confusion):\n"
+        "- probe = thin, narrow solid metal rod, uniform diameter end-to-end, "
+        "tip may have a tiny hook or blunt end; NO opening, NO rotating head\n"
+        "- shaver = wider hollow tube with a distinct rectangular or oval "
+        "side-opening (aspiration window) near the tip; shaft is noticeably "
+        "thicker than a probe\n\n"
+        "Other instruments:\n"
+        "- burr = round/spherical or oval abrasive head at tip\n"
+        "- grasper or biter = two metal jaws that open/close at a hinge\n"
+        "- anchor_driver = ribbed or screw-threaded shaft\n"
+        "- electrocautery = smooth wand with flat, angled, or hook-shaped distal tip\n"
+        "- cannula = transparent or yellow plastic hollow tube\n\n"
+        "Vocabulary: {{vocabulary}}.\n"
+        "Respond with strict JSON matching this shape: {{response_schema}}"
+    ),
+}
+
+_task_config_cache: Optional[Dict[str, object]] = None
+
+
+def _read_task_config() -> Dict[str, object]:
+    """Read task_config.json from the Volume. Returns the default config if
+    the file doesn't exist yet (fresh deploy) — so Playground/Label always
+    have *something* to render. The default is the same config the prod
+    workspace has been using; existing workspaces are unaffected."""
+    global _task_config_cache
+    if _task_config_cache is not None:
+        return _task_config_cache
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        with w.files.download(TASK_CONFIG_PATH).contents as f:
+            data = json.loads(_drain_bytes(f).decode("utf-8"))
+        # Backfill any missing top-level keys from the default (forward-compat
+        # if a user saved a partial config before we added a field).
+        for k, v in _DEFAULT_TASK_CONFIG.items():
+            data.setdefault(k, v)
+        _task_config_cache = data
+        return data
+    except Exception as e:
+        log.info(f"[task_config] using built-in default ({e.__class__.__name__})")
+        _task_config_cache = dict(_DEFAULT_TASK_CONFIG)
+        return _task_config_cache
+
+
+def _write_task_config(cfg: Dict[str, object]) -> None:
+    """Atomically write task_config.json to the Volume. Uses tmp + rename so
+    a partial write can never be observed by a concurrent reader."""
+    from databricks.sdk import WorkspaceClient
+    global _task_config_cache
+    # Validate minimally — bad shape would silently break every tab
+    if not isinstance(cfg.get("vocabulary"), list) or not cfg["vocabulary"]:
+        raise ValueError("vocabulary must be a non-empty list")
+    if not isinstance(cfg.get("prompt_template"), str) or not cfg["prompt_template"].strip():
+        raise ValueError("prompt_template must be a non-empty string")
+    w = WorkspaceClient()
+    cfg_dir = TASK_CONFIG_PATH.rsplit("/", 1)[0]
+    try:
+        w.files.create_directory(cfg_dir)
+    except Exception:
+        pass  # already exists
+    tmp_path = TASK_CONFIG_PATH + ".tmp"
+    payload = json.dumps(cfg, indent=2).encode("utf-8")
+    w.files.upload(tmp_path, payload, overwrite=True)
+    # Volumes' "rename" is delete+upload; emulate atomicity by uploading the
+    # final path after the tmp one has been fully written.
+    w.files.upload(TASK_CONFIG_PATH, payload, overwrite=True)
+    try:
+        w.files.delete(tmp_path)
+    except Exception:
+        pass
+    _task_config_cache = cfg
+
+
+def _render_prompt_template(cfg: Dict[str, object]) -> str:
+    """Render `prompt_template` with substitutions:
+      - `{{vocabulary}}` → comma-joined vocab list
+      - `{{response_schema}}` → JSON pretty-print of `response_schema.shape`
+    Tiny custom substitution (not Jinja) so the template stays editable by hand."""
+    tpl = str(cfg.get("prompt_template") or "")
+    vocab = ", ".join(str(v) for v in (cfg.get("vocabulary") or []))
+    shape = ((cfg.get("response_schema") or {}) if isinstance(cfg.get("response_schema"), dict) else {}).get("shape", {})
+    shape_str = json.dumps(shape, separators=(", ", ": "))
+    return tpl.replace("{{vocabulary}}", vocab).replace("{{response_schema}}", shape_str)
+
+
+def _resolve_path(obj: object, path: str) -> object:
+    """Resolve a JSONPath-ish lens like "instruments[0].class" against a
+    parsed response. Returns None if any segment is missing rather than
+    raising — the UI degrades gracefully when a model returns a partial
+    response."""
+    if obj is None or not path:
+        return None
+    cur: object = obj
+    # Tokenize: split on '.' then expand '[N]' inside each segment
+    import re as _re
+    for seg in path.split("."):
+        m = _re.match(r"^([^\[\]]*)((?:\[\d+\])*)$", seg)
+        if not m:
+            return None
+        name, idxs = m.group(1), m.group(2)
+        if name:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(name)
+        for ix in _re.findall(r"\[(\d+)\]", idxs):
+            if not isinstance(cur, list):
+                return None
+            i = int(ix)
+            cur = cur[i] if 0 <= i < len(cur) else None
+        if cur is None:
+            return None
+    return cur
+
+
+def _drain_bytes(stream) -> bytes:
+    """Read a streaming response into memory. Files SDK varies between
+    sync iterables and file-like objects."""
+    if hasattr(stream, "read"):
+        return stream.read()
+    return b"".join(stream)
+
+
+def _default_rendered_prompt() -> str:
+    """The prompt used to seed Playground when there's no localStorage draft.
+    Reads from task_config so prompt edits propagate without a code change."""
+    try:
+        return _render_prompt_template(_read_task_config())
+    except Exception:
+        # Pre-DAB env var fallback — keeps existing prod deploys unchanged.
+        return os.environ.get(
+            "DEFAULT_PROMPT",
+            "Identify the surgical instrument visible in this arthroscopy frame.",
+        )
+
+
+DEFAULT_PROMPT = _default_rendered_prompt()
 STUDIO_PER_FRAME_MODEL = os.environ.get("STUDIO_PER_FRAME_MODEL", "databricks-claude-sonnet-4-5")
 STUDIO_VALIDATOR_MODEL = os.environ.get("STUDIO_VALIDATOR_MODEL", "databricks-gpt-5-2")
 STUDIO_AUDIO_ENDPOINT = os.environ.get("STUDIO_AUDIO_ENDPOINT", "whisper-transcription")
@@ -112,12 +305,23 @@ def _openai_client():
 # (matching production apps in this workspace) is to mint an OAuth token at
 # request time using the SP's M2M creds (DATABRICKS_CLIENT_ID/SECRET/HOST,
 # always injected) and use it as the Postgres password.
-LAKEBASE_HOST = os.environ.get(
-    "LAKEBASE_HOST",
-    "instance-6b59171b-cee8-4acc-9209-6c848ffbfbfe.database.cloud.databricks.com",
+# Postgres connection params. The canonical Apps `postgres:` resource binding
+# (added 2026) auto-injects PGHOST/PGDATABASE/PGUSER/PGPORT/PGSSLMODE — read
+# those first. Fall back to the older LAKEBASE_* env vars so existing prod
+# deploys (which still bind via the legacy `database:` Provisioned API) keep
+# working without an immediate migration.
+LAKEBASE_HOST = (
+    os.environ.get("PGHOST")
+    or os.environ.get("LAKEBASE_HOST")
+    or "instance-6b59171b-cee8-4acc-9209-6c848ffbfbfe.database.cloud.databricks.com"
 )
-LAKEBASE_DBNAME = os.environ.get("LAKEBASE_DBNAME", "vlm_workbench")
-LAKEBASE_PORT = int(os.environ.get("LAKEBASE_PORT", 5432))
+LAKEBASE_DBNAME = (
+    os.environ.get("PGDATABASE")
+    or os.environ.get("LAKEBASE_DBNAME")
+    or "vlm_workbench"
+)
+LAKEBASE_PORT = int(os.environ.get("PGPORT") or os.environ.get("LAKEBASE_PORT") or 5432)
+LAKEBASE_SSLMODE = os.environ.get("PGSSLMODE", "require")
 
 _token_cache: Dict[str, object] = {"token": None, "expires_at": 0}
 
@@ -160,9 +364,10 @@ def _lakebase_token() -> Optional[str]:
 
 
 def _pg_user() -> Optional[str]:
-    # Lakebase Postgres role name == SP client_id (UUID) for app-deployed runtime,
-    # or workspace user email for local-dev with PAT auth.
-    return os.environ.get("DATABRICKS_CLIENT_ID") or os.environ.get("PGUSER") or _ws_user_email()
+    # Lakebase Postgres role name. The Apps `postgres:` binding auto-injects
+    # PGUSER = the SP's client_id (UUID). For PAT-based local dev, fall back
+    # to the workspace user email (which the personal Lakebase role uses).
+    return os.environ.get("PGUSER") or os.environ.get("DATABRICKS_CLIENT_ID") or _ws_user_email()
 
 
 def _ws_user_email() -> Optional[str]:
@@ -234,10 +439,178 @@ def _download_bytes(path: str) -> bytes:
 def health():
     return {
         "status": "ok",
+        "uc_catalog": UC_CATALOG_BOOT,
+        "uc_schema": UC_SCHEMA_BOOT,
+        "volume_name": VOLUME_NAME_BOOT,
         "volume_path": VOLUME_PATH,
         "extracted_frames_dir": EXTRACTED_FRAMES_DIR,
         "eval_frames_dir": EVAL_FRAMES_DIR,
     }
+
+
+# ── Task configuration endpoints ─────────────────────────────────────────
+
+@app.get("/api/task-config")
+def get_task_config():
+    """Return the active task config plus its derived `rendered_prompt`.
+    Falls back to the built-in default if no config has been saved yet."""
+    cfg = _read_task_config()
+    return {**cfg, "rendered_prompt": _render_prompt_template(cfg)}
+
+
+class TaskConfigIn(BaseModel):
+    vocabulary: List[str]
+    response_schema: Optional[Dict[str, object]] = None
+    prompt_template: str
+
+
+class HFTokenIn(BaseModel):
+    token: str
+
+
+@app.post("/api/setup/hf-token")
+def store_hf_token(req: HFTokenIn):
+    """Write the user's HuggingFace token into the configured scope/key so
+    Local models (Qwen3-VL, MedGemma, …) can be downloaded by the
+    setup_cache notebook. The App SP needs WRITE on the scope — grant comes
+    from postdeploy.py's `_grant_secret_write`.
+
+    The scope name + key are workspace-specific values exposed by the DAB's
+    secret bindings (HF_SECRET_SCOPE / HF_SECRET_KEY env vars); if the bound
+    scope is owned by a different team (e.g., the shared `hf` scope on
+    e2-demo-field-eng), the write will 403 — the UI surfaces that as a hint
+    to either request WRITE on the existing scope or point variable-overrides
+    at a user-owned scope."""
+    tok = (req.token or "").strip()
+    if not tok:
+        raise HTTPException(400, "token is empty")
+    if not (tok.startswith("hf_") or tok.startswith("api_")):
+        raise HTTPException(400, "token doesn't look like an HF token (expected `hf_...`)")
+    scope = HF_SECRET_SCOPE
+    key = HF_SECRET_KEY
+    if not scope or not key:
+        raise HTTPException(503, "HF scope/key not configured — set hf_secret_scope and hf_secret_key in variable-overrides.json")
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        w.secrets.put_secret(scope=scope, key=key, string_value=tok)
+    except Exception as e:
+        msg = str(e)
+        if "403" in msg or "PERMISSION" in msg.upper():
+            raise HTTPException(403,
+                f"App SP can't write to scope '{scope}'. Either grant the SP WRITE on "
+                f"the scope, or point hf_secret_scope in variable-overrides.json at a "
+                f"scope you own. Underlying error: {e}")
+        log.exception("hf token put failed")
+        raise HTTPException(500, f"put failed: {e}")
+    return {"ok": True, "scope": scope, "key": key, "len": len(tok)}
+
+
+@app.put("/api/task-config")
+def put_task_config(req: TaskConfigIn):
+    cfg: Dict[str, object] = {
+        "vocabulary": [v.strip() for v in req.vocabulary if v.strip()],
+        "response_schema": req.response_schema or _DEFAULT_TASK_CONFIG["response_schema"],
+        "prompt_template": req.prompt_template,
+    }
+    try:
+        _write_task_config(cfg)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("write task_config failed")
+        raise HTTPException(500, f"write failed: {e}")
+    return {**cfg, "rendered_prompt": _render_prompt_template(cfg)}
+
+
+@app.get("/api/debug/lakebase")
+def debug_lakebase():
+    """Comprehensive Lakebase Postgres diagnostic for the App SP. Each step
+    runs independently so a downstream failure doesn't mask an upstream one.
+    Returns the full picture: env, token mint, TCP connect, role identity,
+    schema visibility, and DDL capability."""
+    out: Dict[str, object] = {
+        "env": {
+            "LAKEBASE_HOST": LAKEBASE_HOST,
+            "LAKEBASE_PORT": LAKEBASE_PORT,
+            "LAKEBASE_DBNAME": LAKEBASE_DBNAME,
+            "DATABRICKS_CLIENT_ID_present": bool(os.environ.get("DATABRICKS_CLIENT_ID")),
+            "DATABRICKS_CLIENT_ID_first8": (os.environ.get("DATABRICKS_CLIENT_ID") or "")[:8],
+            "DATABRICKS_CLIENT_SECRET_present": bool(os.environ.get("DATABRICKS_CLIENT_SECRET")),
+            "DATABRICKS_HOST": os.environ.get("DATABRICKS_HOST"),
+        },
+        "steps": [],
+    }
+    def step(name: str, fn):
+        try:
+            out["steps"].append({"name": name, "ok": True, "result": fn()})
+        except Exception as e:
+            out["steps"].append({"name": name, "ok": False, "error": f"{type(e).__name__}: {e}"[:400]})
+
+    # 1. mint token
+    tok_holder: Dict[str, object] = {}
+    def _mint():
+        t = _lakebase_token()
+        tok_holder["token"] = t
+        return {"len": len(t or ""), "first20": (t or "")[:20]}
+    step("mint_oauth_token", _mint)
+
+    # 2. computed user
+    step("compute_pg_user", lambda: {"user": _pg_user()})
+
+    # 3. raw TCP connect (no auth) — distinguishes network vs auth failures
+    def _tcp():
+        import socket
+        s = socket.create_connection((LAKEBASE_HOST, LAKEBASE_PORT), timeout=10)
+        s.close()
+        return "tcp_open"
+    step("tcp_connect", _tcp)
+
+    # 4. authenticated connect + current identity
+    def _connect_and_select():
+        import psycopg
+        with psycopg.connect(
+            host=LAKEBASE_HOST, port=LAKEBASE_PORT,
+            user=_pg_user(), password=tok_holder.get("token"),
+            dbname=LAKEBASE_DBNAME, sslmode="require", autocommit=True,
+            connect_timeout=10,
+        ) as conn, conn.cursor() as cur:
+            cur.execute("SELECT current_user, current_database(), version()")
+            row = cur.fetchone()
+            return {"current_user": row[0], "current_database": row[1], "version": row[2][:80]}
+    step("connect_select", _connect_and_select)
+
+    # 5. schema visibility — what schemas can the role see?
+    def _list_schemas():
+        import psycopg
+        with psycopg.connect(
+            host=LAKEBASE_HOST, port=LAKEBASE_PORT,
+            user=_pg_user(), password=tok_holder.get("token"),
+            dbname=LAKEBASE_DBNAME, sslmode="require", autocommit=True,
+            connect_timeout=10,
+        ) as conn, conn.cursor() as cur:
+            cur.execute("SELECT schema_name FROM information_schema.schemata ORDER BY 1")
+            return [r[0] for r in cur.fetchall()]
+    step("list_schemas", _list_schemas)
+
+    # 6. CREATE TABLE — the real failure mode for _ensure_ingest_tables()
+    def _create_tmp_table():
+        import psycopg
+        with psycopg.connect(
+            host=LAKEBASE_HOST, port=LAKEBASE_PORT,
+            user=_pg_user(), password=tok_holder.get("token"),
+            dbname=LAKEBASE_DBNAME, sslmode="require", autocommit=True,
+            connect_timeout=10,
+        ) as conn, conn.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS vlmwb_debug_probe (id INT, note TEXT)")
+            cur.execute("INSERT INTO vlmwb_debug_probe VALUES (1, 'ok') ON CONFLICT DO NOTHING")
+            cur.execute("SELECT count(*) FROM vlmwb_debug_probe")
+            n = cur.fetchone()[0]
+            cur.execute("DROP TABLE vlmwb_debug_probe")
+            return {"rows_inserted_and_dropped": n}
+    step("ddl_probe", _create_tmp_table)
+
+    return out
 
 
 @app.get("/api/debug/mlflow")
@@ -1014,20 +1387,11 @@ def _resolve_optimizer_notebook(kind: str) -> str:
     )
     _NOTEBOOK_CACHE[kind] = target_path
     return target_path
-OPTIMIZER_RUNS_DIR = os.environ.get(
-    "OPTIMIZER_RUNS_DIR",
-    "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/optimizer_runs",
-)
+OPTIMIZER_RUNS_DIR = os.environ.get("OPTIMIZER_RUNS_DIR", f"{VOLUME_PATH}/optimizer_runs")
 
 # ── Local (open-weight) models served via serverless GPU jobs ─────────
-LOCAL_MODELS_DIR = os.environ.get(
-    "LOCAL_MODELS_DIR",
-    "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/local_models",
-)
-LOCAL_RUNS_DIR = os.environ.get(
-    "LOCAL_RUNS_DIR",
-    "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/local_runs",
-)
+LOCAL_MODELS_DIR = os.environ.get("LOCAL_MODELS_DIR", f"{VOLUME_PATH}/local_models")
+LOCAL_RUNS_DIR = os.environ.get("LOCAL_RUNS_DIR", f"{VOLUME_PATH}/local_runs")
 
 # HF secret scope/key the bundled notebooks read via dbutils.secrets.get.
 # Threaded into every YAML config so the notebooks don't need to know which
@@ -1275,10 +1639,10 @@ def get_local_run_status(run_id: str, databricks_run_id: str):
 
 FINETUNE_RUNS_DIR = os.environ.get(
     "FINETUNE_RUNS_DIR",
-    "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/finetune_runs",
+    f"{VOLUME_PATH}/finetune_runs",
 )
-UC_CATALOG = os.environ.get("UC_CATALOG", "hls_amer_catalog")
-UC_SCHEMA = os.environ.get("UC_SCHEMA", "guanyu_chen")
+UC_CATALOG = UC_CATALOG_BOOT
+UC_SCHEMA = UC_SCHEMA_BOOT
 def _default_mlflow_experiment_path() -> str:
     """Place the experiment under the SP's own workspace home — that's the
     one path we're guaranteed CAN_MANAGE on. Putting it under the human
@@ -3024,14 +3388,8 @@ def labels_stats():
 # the Lakebase `videos` + `extracted_frames_index` tables so the app can list
 # them instantly without scanning the Volume.
 
-VIDEOS_INBOX_DIR = os.environ.get(
-    "VIDEOS_INBOX_DIR",
-    "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/videos/inbox",
-)
-IMAGES_INBOX_DIR = os.environ.get(
-    "IMAGES_INBOX_DIR",
-    "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/images",
-)
+VIDEOS_INBOX_DIR = os.environ.get("VIDEOS_INBOX_DIR", f"{VOLUME_PATH}/videos/inbox")
+IMAGES_INBOX_DIR = os.environ.get("IMAGES_INBOX_DIR", f"{VOLUME_PATH}/images")
 EXTRACTED_FRAMES_DIR_DEFAULT = os.environ.get(
     "EXTRACTED_FRAMES_DIR", EXTRACTED_FRAMES_DIR,
 )
@@ -3233,6 +3591,68 @@ def list_ingest_videos():
     return {"videos": list(by_name.values())}
 
 
+# ── Library upload (videos + image batches) ─────────────────────────────
+#
+# Streams uploads from the browser straight into the Volume's inbox folders
+# so users don't have to use the catalog explorer or CLI. The App SP needs
+# WRITE VOLUME (granted by postdeploy.py).
+_ALLOWED_VIDEO_EXT = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
+_ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _safe_basename(name: str) -> str:
+    base = os.path.basename(name or "").strip()
+    # Strip directory traversal + reserved chars; pathlib's PurePosixPath would
+    # do it too but we want to be obvious.
+    return "".join(c for c in base if c.isalnum() or c in "._- ") or "upload.bin"
+
+
+@app.post("/api/library/upload")
+async def library_upload(
+    kind: str = Form(...),                 # "video" | "image_batch"
+    batch_name: Optional[str] = Form(None), # required if kind == "image_batch"
+    file: UploadFile = File(...),
+):
+    """Stream a single file into the appropriate Volume inbox.
+    For image batches, all files in a batch must use the same `batch_name`
+    so they land in the same subfolder.
+    Multi-file uploads from the browser issue this endpoint once per file."""
+    from databricks.sdk import WorkspaceClient
+    fname = _safe_basename(file.filename or "upload")
+    ext = os.path.splitext(fname)[1].lower()
+    if kind == "video":
+        if ext not in _ALLOWED_VIDEO_EXT:
+            raise HTTPException(400, f"unsupported video extension {ext!r}; allowed: {sorted(_ALLOWED_VIDEO_EXT)}")
+        dest_dir = VIDEOS_INBOX_DIR
+    elif kind == "image_batch":
+        if not (batch_name or "").strip():
+            raise HTTPException(400, "batch_name required for image_batch uploads")
+        if ext not in _ALLOWED_IMAGE_EXT:
+            raise HTTPException(400, f"unsupported image extension {ext!r}; allowed: {sorted(_ALLOWED_IMAGE_EXT)}")
+        # Reuse same sanitizer for the folder name
+        safe_batch = "".join(c for c in batch_name.strip() if c.isalnum() or c in "._-") or "batch"
+        dest_dir = f"{IMAGES_INBOX_DIR}/{safe_batch}"
+    else:
+        raise HTTPException(400, f"kind must be 'video' or 'image_batch', got {kind!r}")
+
+    w = WorkspaceClient()
+    try:
+        w.files.create_directory(dest_dir)
+    except Exception:
+        pass  # already exists
+
+    dest_path = f"{dest_dir}/{fname}"
+    body = await file.read()
+    if not body:
+        raise HTTPException(400, "empty upload")
+    try:
+        w.files.upload(dest_path, body, overwrite=True)
+    except Exception as e:
+        log.exception("upload failed")
+        raise HTTPException(500, f"upload failed: {e}")
+    return {"path": dest_path, "size_bytes": len(body), "kind": kind}
+
+
 @app.post("/api/videos/ingest", response_model=IngestResponse)
 def kick_off_ingest(req: IngestRequest):
     """Submit the smart-frame extractor for one (or all pending) video(s).
@@ -3259,10 +3679,27 @@ def kick_off_ingest(req: IngestRequest):
     # Mint a fresh Lakebase token to hand to the notebook so it can connect
     # back to Postgres as the SP. (The notebook's exec context doesn't share
     # the app's env vars.)
+    #
+    # SECURITY: do NOT include the Postgres password in the config we write
+    # to the Volume — anyone with READ VOLUME could read it. The notebook
+    # mints its own token from inside, using the SP identity it runs as.
     pg_user = _pg_user()
-    pg_password = _lakebase_token()
-    if not pg_password or not pg_user:
-        raise HTTPException(500, "could not mint Lakebase credentials for the ingest job")
+    if not pg_user:
+        raise HTTPException(500, "could not resolve Lakebase user for the ingest job")
+    # Endpoint paths for the notebook's mint step. We pass both styles so the
+    # notebook auto-detects Project vs legacy Provisioned at runtime.
+    lb_instance = os.environ.get("PGDATABASE_INSTANCE") or os.environ.get("LAKEBASE_INSTANCE") or ""
+    lb_branch = os.environ.get("LAKEBASE_BRANCH", "production")
+    # `PGAPPNAME` is set when the postgres: binding is active; from it we can
+    # infer the endpoint. Otherwise we leave pg_endpoint empty and rely on
+    # pg_instance for Provisioned deploys.
+    pg_endpoint = ""
+    pg_instance = ""
+    # If LAKEBASE_HOST looks like a Project endpoint host, use the var path
+    if "ep-" in LAKEBASE_HOST and lb_instance:
+        pg_endpoint = f"projects/{lb_instance}/branches/{lb_branch}/endpoints/primary"
+    else:
+        pg_instance = lb_instance
 
     notebook_path = _resolve_ingest_notebook()
     w = _workspace()
@@ -3306,7 +3743,11 @@ def kick_off_ingest(req: IngestRequest):
             "pg_port": LAKEBASE_PORT,
             "pg_dbname": LAKEBASE_DBNAME,
             "pg_user": pg_user,
-            "pg_password": pg_password,
+            # No `pg_password` — the notebook mints its own at runtime via
+            # /api/2.0/postgres/credentials using its SP identity. We pass
+            # the endpoint/instance so it knows which to ask for.
+            "pg_endpoint": pg_endpoint,
+            "pg_instance": pg_instance,
             "candidate_fps": req.candidate_fps,
             "max_frames": req.max_frames,
         }

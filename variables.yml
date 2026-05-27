@@ -21,11 +21,27 @@ variables:
     description: ID of a SQL warehouse the App SP can `CAN_USE`. Used for Delta sync.
 
   lakebase_instance:
-    description: Lakebase Postgres instance name (e.g. `lakebasepoc`).
+    description: |
+      Lakebase Postgres project (new "Autoscaling" model) or instance
+      ("Provisioned" model) name. Provisioned can't be created after
+      2026-03-12; new workspaces should use Projects.
+
+  lakebase_branch:
+    description: Branch within a Lakebase Autoscaling project. Ignored for legacy Provisioned instances.
+    default: production
 
   lakebase_database:
-    description: Lakebase database name within the instance.
-    default: vlm_workbench
+    description: |
+      Postgres database name (the SQL identifier used in `\\c dbname`, e.g. `databricks_postgres`).
+    default: databricks_postgres
+
+  lakebase_database_path:
+    description: |
+      DAB resource-path slug for the database, used inside the App's
+      `postgres:` binding. For Lakebase Projects this is typically the
+      Postgres name with underscores → dashes (e.g. `databricks-postgres`).
+      Get it via `databricks api get /api/2.0/postgres/projects/<proj>/branches/<br>/databases`.
+    default: databricks-postgres
 
   hf_secret_scope:
     description: Existing Databricks secret scope holding HF_TOKEN (gated model downloads).

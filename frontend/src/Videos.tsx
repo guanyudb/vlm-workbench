@@ -10,8 +10,9 @@ import { Label } from "@/components/ui/label";
 import { api, type IngestVideoRow } from "@/api";
 import { cn } from "@/lib/utils";
 
-const VIDEOS_INBOX_PATH = "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/videos/inbox/";
-const IMAGES_INBOX_PATH = "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/images/";
+// Fallback paths used until /api/health resolves. The deployed workspace's
+// actual volume path comes from env (VOLUME_PATH) via /api/health.
+const FALLBACK_VOLUME = "/Volumes/<catalog>/<schema>/<volume>";
 
 function fmtBytes(b: number | null | undefined): string {
   if (!b) return "—";
@@ -48,6 +49,9 @@ export default function Videos() {
   const [candidateFps, setCandidateFps] = useState<number>(1.0);
   const [maxFrames, setMaxFrames] = useState<number>(40);
   const [error, setError] = useState<string | null>(null);
+  const [volumePath, setVolumePath] = useState<string>(FALLBACK_VOLUME);
+  const videosInboxPath = `${volumePath}/videos/inbox/`;
+  const imagesInboxPath = `${volumePath}/images/`;
 
   const refresh = () => {
     setLoading(true);
@@ -57,6 +61,14 @@ export default function Videos() {
       .finally(() => setLoading(false));
   };
   useEffect(refresh, []);
+
+  // Fetch the workspace's volume path once so the Library hints (and any
+  // other path callouts) match the deployed workspace's UC layout.
+  useEffect(() => {
+    api.health()
+      .then((h) => { if (h.volume_path) setVolumePath(h.volume_path); })
+      .catch(() => { /* fall back to the placeholder string */ });
+  }, []);
 
   // Auto-refresh every 10s if anything is in-flight, so the UI follows along
   // with the running ingest jobs without a manual refresh.
@@ -147,12 +159,14 @@ export default function Videos() {
         <h1 className="text-2xl font-semibold">Library</h1>
         <p className="text-sm text-muted-foreground">
           Two ways to add data: drop <span className="font-medium">MP4s</span> into{" "}
-          <span className="font-mono text-xs">{VIDEOS_INBOX_PATH}</span> and they'll get smart-frame
+          <span className="font-mono text-xs">{videosInboxPath}</span> and they'll get smart-frame
           extracted, OR drop <span className="font-medium">JPGs/PNGs</span> into a subfolder of{" "}
-          <span className="font-mono text-xs">{IMAGES_INBOX_PATH}</span> and they'll register as a
+          <span className="font-mono text-xs">{imagesInboxPath}</span> and they'll register as a
           named batch. Both flow into Playground's "Smart-extracted" frame source.
         </p>
       </div>
+
+      <UploadDropZone onUploaded={refresh} />
 
       {/* Stats + actions */}
       <Card>
@@ -305,5 +319,111 @@ export default function Videos() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+// ── Drag-and-drop upload zone for the Library tab ────────────────────────
+//
+// Streams files straight into the Volume inbox via POST /api/library/upload.
+// Splits a drop by file type: .mp4/.mov/etc → videos/inbox/, images → an
+// image batch (user must name it first). Each file is one request so partial
+// failures don't kill the rest.
+function UploadDropZone({ onUploaded }: { onUploaded: () => void }) {
+  const [drag, setDrag] = useState(false);
+  const [batchName, setBatchName] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState<string>("");
+  const [err, setErr] = useState<string | null>(null);
+
+  const handleFiles = async (files: FileList | File[]) => {
+    setErr(null);
+    const arr = Array.from(files);
+    if (!arr.length) return;
+    // Split by type
+    const videoExt = /\.(mp4|mov|m4v|mkv|webm)$/i;
+    const imageExt = /\.(jpg|jpeg|png|webp)$/i;
+    const videos = arr.filter((f) => videoExt.test(f.name));
+    const images = arr.filter((f) => imageExt.test(f.name));
+    const other = arr.filter((f) => !videoExt.test(f.name) && !imageExt.test(f.name));
+    if (other.length) {
+      setErr(`unsupported files: ${other.slice(0, 3).map((f) => f.name).join(", ")}${other.length > 3 ? " …" : ""}`);
+      return;
+    }
+    if (images.length && !batchName.trim()) {
+      setErr("name the image batch first (textbox below) — all images in this drop go into one named batch");
+      return;
+    }
+    setUploading(true);
+    try {
+      let ok = 0, fail = 0;
+      const total = arr.length;
+      for (const f of [...videos, ...images]) {
+        setProgress(`${ok + fail + 1}/${total} · ${f.name}`);
+        try {
+          await api.uploadToLibrary(videoExt.test(f.name) ? "video" : "image_batch", f, batchName.trim() || undefined);
+          ok += 1;
+        } catch (e) {
+          fail += 1;
+          console.error("upload failed", f.name, e);
+        }
+      }
+      setProgress(`${ok} uploaded${fail ? ` · ${fail} failed` : ""}`);
+      onUploaded();
+    } finally {
+      setUploading(false);
+      setTimeout(() => setProgress(""), 4000);
+    }
+  };
+
+  return (
+    <Card>
+      <CardContent
+        className={cn(
+          "flex flex-col gap-3 border-2 border-dashed py-6 transition-colors",
+          drag ? "border-primary bg-primary/5" : "border-muted-foreground/20",
+        )}
+        onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+        onDragLeave={() => setDrag(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDrag(false);
+          if (e.dataTransfer.files?.length) handleFiles(e.dataTransfer.files);
+        }}
+      >
+        <div className="flex flex-wrap items-center gap-3">
+          <Upload className="size-5 text-muted-foreground" />
+          <p className="text-sm">
+            Drop videos (<span className="font-mono text-xs">.mp4 .mov .mkv …</span>) or images
+            (<span className="font-mono text-xs">.jpg .png .webp</span>) here, or
+          </p>
+          <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border bg-card px-3 py-1.5 text-xs font-medium hover:bg-accent">
+            <input
+              type="file"
+              multiple
+              accept=".mp4,.mov,.m4v,.mkv,.webm,.jpg,.jpeg,.png,.webp"
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files) handleFiles(e.target.files);
+                e.target.value = "";  // allow re-selecting same files
+              }}
+            />
+            Choose files
+          </label>
+          {uploading && <Loader2 className="size-4 animate-spin text-muted-foreground" />}
+          {progress && <span className="text-xs text-muted-foreground">{progress}</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          <Label className="text-xs">Image batch name (required for images)</Label>
+          <Input
+            value={batchName}
+            onChange={(e) => setBatchName(e.target.value)}
+            placeholder="e.g. arthrex_demo_01"
+            className="h-8 max-w-xs"
+            disabled={uploading}
+          />
+        </div>
+        {err && <p className="text-xs text-destructive">{err}</p>}
+      </CardContent>
+    </Card>
   );
 }

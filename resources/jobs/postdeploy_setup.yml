@@ -15,14 +15,20 @@ resources:
             notebook_path: ../../setup/postdeploy.py
             source: WORKSPACE
             base_parameters:
-              uc_catalog: ${var.uc_catalog}
-              uc_schema: ${var.uc_schema}
-              volume_name: ${var.volume_name}
-              app_name: ${var.app_name}
+              # Reference the resolved resource names so dev-mode prefixes are
+              # respected (DAB prepends `dev_<user>_` to schemas + volumes in
+              # `mode: development`). Using `${var.uc_schema}` directly here
+              # would pass the un-prefixed name and the postdeploy GRANTs would
+              # error with `SCHEMA_DOES_NOT_EXIST`.
+              uc_catalog: ${resources.schemas.workbench_schema.catalog_name}
+              uc_schema: ${resources.schemas.workbench_schema.name}
+              volume_name: ${resources.volumes.medical_video.name}
+              app_name: ${resources.apps.vlm_workbench_app.name}
               lakebase_instance: ${var.lakebase_instance}
               lakebase_database: ${var.lakebase_database}
-              workbench_secret_scope: ${var.workbench_secret_scope}
+              workbench_secret_scope: ${resources.secret_scopes.workbench_config_scope.name}
               hf_secret_scope: ${var.hf_secret_scope}
+              hf_secret_key: ${var.hf_secret_key}
           environment_key: cpu_env
       queue:
         enabled: true

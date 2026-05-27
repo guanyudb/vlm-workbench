@@ -283,8 +283,83 @@ export interface StudioAudioResponse {
   cached_at?: number;
 }
 
+export interface TaskResponseSchema {
+  // JSON shape sent to the LLM as the expected output (substituted into
+  // `{{response_schema}}` in the prompt template).
+  shape: unknown;
+  // JSONPath-ish lenses used by every UI that parses model responses.
+  primary_class_path: string;       // e.g., "instruments[0].class"
+  evidence_path?: string;
+  confidence_path?: string;
+  aux_fields?: { path: string; label: string }[];
+}
+
+export interface TaskConfig {
+  vocabulary: string[];
+  response_schema: TaskResponseSchema;
+  prompt_template: string;
+  rendered_prompt: string;
+}
+
+// Resolve a JSONPath-ish lens like "instruments[0].class" against a parsed
+// response. Returns undefined if any segment is missing — every UI that
+// reads a model response should degrade gracefully.
+export function resolvePath(obj: unknown, path: string | undefined): unknown {
+  if (obj == null || !path) return undefined;
+  let cur: any = obj;
+  for (const seg of path.split(".")) {
+    const m = seg.match(/^([^\[\]]*)((?:\[\d+\])*)$/);
+    if (!m) return undefined;
+    const [, name, idxs] = m;
+    if (name) {
+      if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return undefined;
+      cur = cur[name];
+    }
+    for (const ix of idxs.matchAll(/\[(\d+)\]/g)) {
+      if (!Array.isArray(cur)) return undefined;
+      cur = cur[parseInt(ix[1], 10)];
+    }
+    if (cur == null) return undefined;
+  }
+  return cur;
+}
+
 export const api = {
-  health: () => fetch("/api/health").then(asJson<{ status: string }>),
+  health: () => fetch("/api/health").then(asJson<{
+    status: string;
+    uc_catalog: string;
+    uc_schema: string;
+    volume_name: string;
+    volume_path: string;
+    extracted_frames_dir: string;
+    eval_frames_dir: string;
+  }>),
+
+  getTaskConfig: () => fetch("/api/task-config").then(asJson<TaskConfig>),
+
+  saveTaskConfig: (cfg: Pick<TaskConfig, "vocabulary" | "prompt_template"> &
+                        { response_schema?: TaskResponseSchema }) =>
+    fetch("/api/task-config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    }).then(asJson<TaskConfig>),
+
+  storeHFToken: (token: string) =>
+    fetch("/api/setup/hf-token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    }).then(asJson<{ ok: boolean; scope: string; key: string; len: number }>),
+
+  uploadToLibrary: (kind: "video" | "image_batch", file: File, batchName?: string) => {
+    const fd = new FormData();
+    fd.append("kind", kind);
+    if (batchName) fd.append("batch_name", batchName);
+    fd.append("file", file);
+    return fetch("/api/library/upload", { method: "POST", body: fd })
+      .then(asJson<{ path: string; size_bytes: number; kind: string }>);
+  },
 
   videos: () => fetch("/api/videos").then(asJson<VideoEntry[]>),
 

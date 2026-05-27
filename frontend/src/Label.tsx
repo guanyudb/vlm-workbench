@@ -13,34 +13,38 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { api, type FrameLabel, type RunResultRow, type SnapshotSummary } from "@/api";
+import { api, resolvePath, type FrameLabel, type RunResultRow, type SnapshotSummary, type TaskResponseSchema } from "@/api";
 import { cn } from "@/lib/utils";
 
-const INSTRUMENT_VOCAB = [
+// Fallback vocab used until /api/task-config resolves. The active vocab is
+// fetched at mount and rendered into the picker + hotkey map below.
+const FALLBACK_VOCAB = [
   "probe", "shaver", "burr", "grasper", "biter", "suture_passer",
   "anchor_driver", "electrocautery", "cannula", "scissors", "drill_guide",
   "trocar", "knot_pusher", "rasp", "other_metal_tool", "no_instrument_visible",
 ];
 
-// Hotkey order — first 9 vocab entries map to digits 1–9.
-const HOTKEY_VOCAB = INSTRUMENT_VOCAB.slice(0, 9);
+// Generic extractor over a JSONPath-ish lens declared in task_config.
+// Falls back to legacy paths so older snapshots / mid-migration responses
+// still render before /api/task-config resolves.
+const LEGACY_INSTRUMENT_PATHS = ["instruments[0].class", "instrument"];
+const LEGACY_EVIDENCE_PATHS = ["instruments[0].evidence", "evidence"];
 
-function extractInstrument(parsed: any): string | null {
+function extractByPath(parsed: any, path: string | undefined, fallbacks: string[] = []): string | null {
   if (!parsed) return null;
-  if (typeof parsed.instrument === "string") return parsed.instrument;
-  const list = parsed.instruments;
-  if (Array.isArray(list) && list.length && typeof list[0] === "object") {
-    return list[0].class ?? null;
+  const tryOne = (p: string) => {
+    const v = resolvePath(parsed, p);
+    return typeof v === "string" && v ? v : null;
+  };
+  if (path) {
+    const v = tryOne(path);
+    if (v) return v;
+  }
+  for (const p of fallbacks) {
+    const v = tryOne(p);
+    if (v) return v;
   }
   return null;
-}
-function extractAnatomy(parsed: any): string | null {
-  if (!parsed) return null;
-  return parsed.anatomy || null;
-}
-function extractTissue(parsed: any): string | null {
-  if (!parsed) return null;
-  return parsed.tissue_condition || null;
 }
 function frameBasename(p: string): string {
   return p.split("/").filter(Boolean).pop() || p;
@@ -71,6 +75,26 @@ export default function LabelTab() {
   const [staged, setStaged] = useState<StagedFrame[]>([]);
   const [idx, setIdx] = useState(0);
   const [stats, setStats] = useState<{ total: number; by_instrument: { instrument: string; n: number }[] } | null>(null);
+
+  // Task config (vocabulary + response schema) — single source of truth
+  // shared with Playground (prompt), the optimizer, and snapshot
+  // save/restore. Falls back to legacy hardcoded values until the fetch
+  // resolves so the first paint isn't blank.
+  const [vocab, setVocab] = useState<string[]>(FALLBACK_VOCAB);
+  const [schema, setSchema] = useState<TaskResponseSchema | null>(null);
+  const hotkeyVocab = useMemo(() => vocab.slice(0, 9), [vocab]);
+  useEffect(() => {
+    api.getTaskConfig()
+      .then((c) => {
+        if (Array.isArray(c.vocabulary) && c.vocabulary.length) setVocab(c.vocabulary);
+        if (c.response_schema) setSchema(c.response_schema);
+      })
+      .catch(() => { /* stick with fallback */ });
+  }, []);
+  const auxFields = schema?.aux_fields ?? [
+    { path: "anatomy", label: "Anatomy" },
+    { path: "tissue_condition", label: "Tissue condition" },
+  ];
 
   const refreshStats = () => api.labelsStats().then(setStats).catch(() => {});
 
@@ -115,10 +139,10 @@ export default function LabelTab() {
       const rows: StagedFrame[] = snap.frame_paths.map((path) => {
         const r = byFrame.get(frameBasename(path)) || byFrame.get(path);
         const existing = existingByPath.get(path) || null;
-        const predInstrument = r ? extractInstrument(r.parsed) : null;
-        const predAnatomy = r ? extractAnatomy(r.parsed) : null;
-        const predTissue = r ? extractTissue(r.parsed) : null;
-        const evidence = (r?.parsed as any)?.instruments?.[0]?.evidence ?? (r?.parsed as any)?.evidence ?? null;
+        const predInstrument = extractByPath(r?.parsed, schema?.primary_class_path, LEGACY_INSTRUMENT_PATHS);
+        const predAnatomy = extractByPath(r?.parsed, auxFields.find((f) => /anatomy/i.test(f.label))?.path, ["anatomy"]);
+        const predTissue = extractByPath(r?.parsed, auxFields.find((f) => /tissue/i.test(f.label))?.path, ["tissue_condition"]);
+        const evidence = extractByPath(r?.parsed, schema?.evidence_path, LEGACY_EVIDENCE_PATHS);
         return {
           frame_path: path,
           predicted: {
@@ -231,7 +255,7 @@ export default function LabelTab() {
       else if (e.key === "Enter") { e.preventDefault(); saveCurrent(); }
       else if (e.key === "s" || e.key === "S") { e.preventDefault(); skipCurrent(); }
       else if (/^[1-9]$/.test(e.key)) {
-        const v = HOTKEY_VOCAB[parseInt(e.key, 10) - 1];
+        const v = hotkeyVocab[parseInt(e.key, 10) - 1];
         if (v) { e.preventDefault(); updateDraft({ instrument: v }); }
       }
     };
@@ -406,7 +430,7 @@ export default function LabelTab() {
                     <Select value={current.draft.instrument || undefined} onValueChange={(v) => updateDraft({ instrument: v })}>
                       <SelectTrigger><SelectValue placeholder="Pick…" /></SelectTrigger>
                       <SelectContent>
-                        {INSTRUMENT_VOCAB.map((v, i) => (
+                        {vocab.map((v, i) => (
                           <SelectItem key={v} value={v}>
                             {i < 9 && <span className="mr-1.5 text-[10px] text-muted-foreground">{i + 1}</span>}
                             {v}

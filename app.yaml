@@ -6,20 +6,21 @@ command:
   - --port
   - "8000"
 
-resources:
-  - name: sql-warehouse
-    sql_warehouse:
-      id: "18ca4fa4ce58f74c"
-      permission: CAN_USE
-  - name: lakebase
-    database:
-      database_name: vlm_workbench
-      instance_name: lakebasepoc
-      permission: CAN_CONNECT_AND_CREATE
+# Workspace-specific resources (warehouse, lakebase, secret scope) and the
+# UC catalog/schema/volume identifiers are bound by the Databricks Asset
+# Bundle (resources/app.yml) — NOT hardcoded here — so a fresh workspace
+# deploys without editing this file.
+#
+# At runtime app.py reads:
+#   - UC_CATALOG, UC_SCHEMA, VOLUME_NAME    — set by DAB secret bindings
+#   - DATABRICKS_HOST                       — auto-set by the Apps runtime
+#   - DATABRICKS_WAREHOUSE_ID               — set by DAB sql_warehouse binding
+#   - HF_TOKEN                              — set by DAB secret binding
+#   - DATABRICKS_CLIENT_ID/CLIENT_SECRET    — auto-set for SP M2M OAuth
+#
+# Only static / workspace-agnostic values belong below.
 
 env:
-  - name: DATABRICKS_HOST
-    value: "https://fe-vm-hls-amer.cloud.databricks.com/"
   # mlflow.genai needs the Databricks SDK auth path; this flag lets MLflow
   # use the SP's M2M OAuth creds instead of trying to mint a legacy token.
   - name: MLFLOW_ENABLE_DB_SDK
@@ -28,18 +29,33 @@ env:
     value: "databricks"
   - name: MLFLOW_REGISTRY_URI
     value: "databricks-uc"
+
+  # ── Workspace-specific values, sourced from DAB resource bindings ──────
+  # Apps does NOT auto-expose resource bindings as env vars — each one must
+  # be mapped here by `valueFrom: <resource-name>`. The resource names below
+  # match those declared in resources/app.yml.
+  - name: UC_CATALOG
+    valueFrom: uc_catalog
+  - name: UC_SCHEMA
+    valueFrom: uc_schema
+  - name: VOLUME_NAME
+    valueFrom: volume_name
+  - name: HF_TOKEN
+    valueFrom: hf_token
+  - name: HF_SECRET_SCOPE
+    valueFrom: hf_secret_scope
+  - name: HF_SECRET_KEY
+    valueFrom: hf_secret_key
   - name: DATABRICKS_WAREHOUSE_ID
-    value: "18ca4fa4ce58f74c"
-  - name: CATALOG
-    value: "hls_amer_catalog"
-  - name: SCHEMA
-    value: "guanyu_chen"
-  - name: VOLUME_PATH
-    value: "/Volumes/hls_amer_catalog/guanyu_chen/medical_video"
-  - name: EXTRACTED_FRAMES_DIR
-    value: "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/extracted_frames"
-  - name: EVAL_FRAMES_DIR
-    value: "/Volumes/hls_amer_catalog/guanyu_chen/medical_video/eval_frames"
+    valueFrom: sql_warehouse
+  # The `postgres:` resource binding (resources/app.yml) auto-injects
+  # PGHOST, PGDATABASE, PGUSER, PGPORT, PGSSLMODE — no valueFrom needed.
+  # We do need the project name + branch for the ingest notebook's
+  # runtime token mint — those aren't auto-exposed.
+  - name: LAKEBASE_INSTANCE
+    valueFrom: lakebase_instance
+  - name: LAKEBASE_BRANCH
+    valueFrom: lakebase_branch
   # Default prompt seeded into the Playground (the GEPA winner from our experiments)
   - name: DEFAULT_PROMPT
     value: |

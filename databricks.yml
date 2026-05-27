@@ -35,6 +35,13 @@ sync:
     - .git
     - .claude
     - chat.md
+  # `static/` is gitignored (it's a build artifact), but DAB respects
+  # .gitignore by default — so we must force-include it here, otherwise the
+  # App boots without the React UI and every page 500s with
+  # `FileNotFoundError: ... static/index.html`. Run `./build.sh` before
+  # `databricks bundle deploy` so static/ contains the latest Vite output.
+  include:
+    - static/**
 
 targets:
   # Local dev — deploys under your personal workspace home, suitable for the
@@ -43,6 +50,24 @@ targets:
   dev:
     mode: development
     default: true
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+      - user_name: ${workspace.current_user.userName}
+        level: CAN_MANAGE
+    run_as:
+      user_name: ${workspace.current_user.userName}
+
+  # Test-in-different-workspace target. Reads
+  # .databricks/bundle/dev_e2fe/variable-overrides.json for per-workspace
+  # values.
+  #
+  # Intentionally NO `mode: development` here. Dev mode silently prepends
+  # `dev_<user>_` to UC schema + volume names and `[dev <user>]` to jobs,
+  # which contradicts the variable-overrides you've explicitly set. With
+  # no mode the names you specify in variable-overrides.json are used
+  # verbatim.
+  dev_e2fe:
     workspace:
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
     permissions:

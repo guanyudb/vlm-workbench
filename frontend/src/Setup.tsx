@@ -6,7 +6,13 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { api } from "@/api";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter,
+  DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
+import { api, type TaskConfig } from "@/api";
 import { cn } from "@/lib/utils";
 
 type Check = {
@@ -135,6 +141,9 @@ export default function Setup() {
                           <ExternalLink className="size-3" /> Docs
                         </a>
                       )}
+                      {/HuggingFace/i.test(c.name) && (
+                        <HFTokenDialog onSaved={refresh} />
+                      )}
                     </div>
                   )}
                 </div>
@@ -146,6 +155,8 @@ export default function Setup() {
           </div>
         </CardContent>
       </Card>
+
+      <TaskConfigCard />
 
       <Card>
         <CardHeader className="pb-3">
@@ -191,6 +202,73 @@ export default function Setup() {
   );
 }
 
+// ── HF token paste dialog ────────────────────────────────────────────────
+//
+// Posts the token to /api/setup/hf-token, which writes it to the workspace's
+// configured hf_secret_scope/key. App SP must have WRITE on the scope —
+// postdeploy.py tries to grant that automatically when the deployer owns
+// the scope; if not, the API returns 403 and the dialog surfaces the error.
+function HFTokenDialog({ onSaved }: { onSaved: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [token, setToken] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [ok, setOk] = useState<string | null>(null);
+
+  const save = async () => {
+    setSaving(true);
+    setErr(null);
+    setOk(null);
+    try {
+      const r = await api.storeHFToken(token.trim());
+      setOk(`stored in scope=${r.scope}, key=${r.key} (${r.len} chars)`);
+      setToken("");
+      onSaved();
+      setTimeout(() => setOpen(false), 1500);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <Button size="sm" className="mt-3" onClick={() => setOpen(true)}>
+        Set token in-app
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>HuggingFace token</DialogTitle>
+            <DialogDescription>
+              Pasted directly into the workspace secret scope this App is bound to. We never log it. Get one from <a className="text-primary underline" href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer">huggingface.co/settings/tokens</a>.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            type="password"
+            placeholder="hf_..."
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            spellCheck={false}
+            autoFocus
+          />
+          {err && <p className="text-xs text-destructive">{err}</p>}
+          {ok && <p className="text-xs text-emerald-600">{ok}</p>}
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" size="sm">Cancel</Button>
+            </DialogClose>
+            <Button size="sm" disabled={!token.trim() || saving} onClick={save}>
+              {saving ? <Loader2 className="size-3 animate-spin" /> : null} Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
 function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
   return (
     <div className="flex items-start gap-3">
@@ -202,5 +280,166 @@ function Step({ n, title, children }: { n: number; title: string; children: Reac
         <div className="mt-1 space-y-2">{children}</div>
       </div>
     </div>
+  );
+}
+
+// ── Task definition card ─────────────────────────────────────────────────
+//
+// Edits the workspace's task_config.json on the UC Volume. Same source of
+// truth that Playground's prompt + Label's vocab picker + the optimizer's
+// gold-label vocabulary all read from. Saving writes to
+// `<volume>/config/task_config.json` and busts the backend cache.
+function TaskConfigCard() {
+  const [cfg, setCfg] = useState<TaskConfig | null>(null);
+  const [vocabText, setVocabText] = useState("");
+  const [promptText, setPromptText] = useState("");
+  const [schemaText, setSchemaText] = useState("");  // JSON blob editor
+  const [schemaErr, setSchemaErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.getTaskConfig()
+      .then((c) => {
+        setCfg(c);
+        setVocabText(c.vocabulary.join("\n"));
+        setPromptText(c.prompt_template);
+        setSchemaText(JSON.stringify(c.response_schema, null, 2));
+      })
+      .catch((e) => setErr((e as Error).message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  // Live-validate the schema JSON so the user knows before Save fails
+  useEffect(() => {
+    if (!schemaText.trim()) { setSchemaErr(null); return; }
+    try {
+      const parsed = JSON.parse(schemaText);
+      if (!parsed || typeof parsed !== "object") throw new Error("must be an object");
+      if (!parsed.primary_class_path) throw new Error("primary_class_path is required");
+      setSchemaErr(null);
+    } catch (e) {
+      setSchemaErr((e as Error).message);
+    }
+  }, [schemaText]);
+
+  const save = async () => {
+    setSaving(true);
+    setSaveMsg(null);
+    setErr(null);
+    try {
+      const vocabulary = vocabText.split("\n").map((s) => s.trim()).filter(Boolean);
+      const response_schema = JSON.parse(schemaText);
+      const c = await api.saveTaskConfig({ vocabulary, prompt_template: promptText, response_schema });
+      setCfg(c);
+      setSaveMsg(`saved · ${vocabulary.length} vocab entries`);
+      setTimeout(() => setSaveMsg(null), 4000);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const reset = () => {
+    if (!cfg) return;
+    setVocabText(cfg.vocabulary.join("\n"));
+    setPromptText(cfg.prompt_template);
+    setSchemaText(JSON.stringify(cfg.response_schema, null, 2));
+    setSaveMsg(null);
+    setErr(null);
+  };
+
+  const dirty = cfg && (
+    vocabText !== cfg.vocabulary.join("\n") ||
+    promptText !== cfg.prompt_template ||
+    schemaText !== JSON.stringify(cfg.response_schema, null, 2)
+  );
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle className="text-base">Task definition</CardTitle>
+            <CardDescription>
+              Vocabulary + prompt template the entire workbench reads from. Edits propagate to Playground, Label, and the optimizer without a redeploy.
+            </CardDescription>
+          </div>
+          <div className="flex items-center gap-2">
+            {saveMsg && <span className="text-xs text-emerald-600">{saveMsg}</span>}
+            {dirty && <Badge variant="secondary" className="font-normal">unsaved</Badge>}
+            <Button variant="ghost" size="sm" onClick={reset} disabled={!dirty || saving}>
+              Reset
+            </Button>
+            <Button size="sm" onClick={save} disabled={!dirty || saving || loading || !!schemaErr}>
+              {saving ? <Loader2 className="size-3 animate-spin" /> : null} Save
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4 text-sm">
+        {loading && <p className="text-xs text-muted-foreground">Loading…</p>}
+        {err && (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {err}
+          </div>
+        )}
+        {!loading && (
+          <>
+            <div>
+              <label className="text-xs font-medium">Vocabulary (one class per line)</label>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                First 9 entries become the digit-key hotkeys in the Label tab.
+              </p>
+              <Textarea
+                value={vocabText}
+                onChange={(e) => setVocabText(e.target.value)}
+                rows={6}
+                className="mt-2 font-mono text-xs"
+                spellCheck={false}
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium">Response schema</label>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                <code className="rounded bg-muted px-1 py-0.5">shape</code> is sent to the LLM (substituted into <code className="rounded bg-muted px-1 py-0.5">{"{{response_schema}}"}</code> in the prompt). The <code className="rounded bg-muted px-1 py-0.5">*_path</code> lenses tell Playground / Label / Studio how to extract fields from the parsed response.
+              </p>
+              <Textarea
+                value={schemaText}
+                onChange={(e) => setSchemaText(e.target.value)}
+                rows={14}
+                className={cn("mt-2 font-mono text-xs", schemaErr && "border-destructive")}
+                spellCheck={false}
+              />
+              {schemaErr && (
+                <p className="mt-1 text-xs text-destructive">JSON: {schemaErr}</p>
+              )}
+            </div>
+            <div>
+              <label className="text-xs font-medium">Prompt template</label>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                <code className="rounded bg-muted px-1 py-0.5">{"{{vocabulary}}"}</code> and <code className="rounded bg-muted px-1 py-0.5">{"{{response_schema}}"}</code> are substituted at request time. This is what Playground's “Reset to default” restores.
+              </p>
+              <Textarea
+                value={promptText}
+                onChange={(e) => setPromptText(e.target.value)}
+                rows={14}
+                className="mt-2 font-mono text-xs"
+                spellCheck={false}
+              />
+            </div>
+            {cfg?.rendered_prompt && (
+              <details className="rounded-md border bg-muted/40 px-3 py-2 text-xs">
+                <summary className="cursor-pointer font-medium">Rendered preview</summary>
+                <pre className="mt-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-muted-foreground">{cfg.rendered_prompt}</pre>
+              </details>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }

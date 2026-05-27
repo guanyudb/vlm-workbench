@@ -44,6 +44,11 @@ function StateBadge({ state, config_state }: { state: string; config_state: stri
 }
 
 export default function Deploy() {
+  const [ucCatalog, setUcCatalog] = useState<string>("<catalog>");
+  const [ucSchema, setUcSchema] = useState<string>("<schema>");
+  useEffect(() => {
+    api.health().then((h) => { setUcCatalog(h.uc_catalog); setUcSchema(h.uc_schema); }).catch(() => {});
+  }, []);
   const [models, setModels] = useState<DeployableModel[]>([]);
   const [endpoints, setEndpoints] = useState<ServingEndpointRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -159,7 +164,7 @@ export default function Deploy() {
           <div>
             <CardTitle className="text-base">Registered models</CardTitle>
             <CardDescription>
-              Models in <span className="font-mono">hls_amer_catalog.guanyu_chen</span> (fine-tunes
+              Models in <span className="font-mono">{ucCatalog}.{ucSchema}</span> (fine-tunes
               from the Train tab + anything else you've registered). Click Deploy to spin up a
               serving endpoint.
             </CardDescription>

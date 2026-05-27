@@ -47,6 +47,13 @@ const ACCELERATORS = [
 ];
 
 export default function Train() {
+  // UC layout for label-rendering only. Pulled from /api/health so the
+  // workbench shows the *actual* registered name regardless of workspace.
+  const [ucCatalog, setUcCatalog] = useState<string>("<catalog>");
+  const [ucSchema, setUcSchema] = useState<string>("<schema>");
+  useEffect(() => {
+    api.health().then((h) => { setUcCatalog(h.uc_catalog); setUcSchema(h.uc_schema); }).catch(() => {});
+  }, []);
   const [localModels, setLocalModels] = useState<LocalModelEntry[]>([]);
   const [labelStats, setLabelStats] = useState<{ total: number; by_instrument: { instrument: string; n: number }[] } | null>(null);
   const [pastRuns, setPastRuns] = useState<FinetuneRunSummary[]>([]);
@@ -262,7 +269,7 @@ export default function Train() {
                 onChange={(e) => setUcModelName(e.target.value)}
               />
               <p className="text-[10px] text-muted-foreground">
-                Registers as <span className="font-mono">hls_amer_catalog.guanyu_chen.{ucModelName || "ft_<ts>"}</span>.
+                Registers as <span className="font-mono">{ucCatalog}.{ucSchema}.{ucModelName || "vlmwb_ft_<ts>"}</span>.
               </p>
             </div>
           </div>

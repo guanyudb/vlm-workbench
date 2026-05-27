@@ -15,11 +15,26 @@ resources:
             id: ${var.sql_warehouse_id}
             permission: CAN_USE
 
-        - name: lakebase
-          database:
-            database_name: ${var.lakebase_database}
-            instance_name: ${var.lakebase_instance}
+        # Lakebase Postgres binding.
+        #   - For new-style **Project** (Autoscaling) Lakebases use `postgres:`
+        #     — this is the supported binding as of 2026 and auto-exposes
+        #     `PGHOST`, `PGDATABASE`, `PGUSER`, `PGPORT`, `PGSSLMODE` env vars.
+        #   - For legacy **Provisioned** (Database Instance) Lakebases use
+        #     `database:` (commented below). Provisioned instances can't be
+        #     created after 2026-03-12; existing ones can still be bound.
+        - name: postgres
+          postgres:
+            branch: projects/${var.lakebase_instance}/branches/${var.lakebase_branch}
+            database: projects/${var.lakebase_instance}/branches/${var.lakebase_branch}/databases/${var.lakebase_database_path}
             permission: CAN_CONNECT_AND_CREATE
+        #
+        # Provisioned (legacy) — uncomment IF and ONLY IF lakebase_instance
+        # points to an old Database Instance:
+        # - name: database
+        #   database:
+        #     database_name: ${var.lakebase_database}
+        #     instance_name: ${var.lakebase_instance}
+        #     permission: CAN_CONNECT_AND_CREATE
 
         # Catalog + schema knobs exposed as secrets so the App reads them via
         # /Volumes/... env vars rather than hardcoding. Same pattern as
@@ -46,4 +61,38 @@ resources:
           secret:
             key: ${var.hf_secret_key}
             scope: ${var.hf_secret_scope}
+            permission: READ
+
+        # Per-workspace HF scope/key names exposed as env vars so the Setup
+        # tab can show *which* scope holds the token and the (forthcoming)
+        # "paste HF token" flow knows where to write. The values are seeded
+        # by setup/postdeploy.py into the workbench_secret_scope; they're
+        # not secret — they're metadata. Apps requires every value-from
+        # env var to come from a `secret` binding though.
+        - name: hf_secret_scope
+          secret:
+            key: hf_secret_scope
+            scope: ${var.workbench_secret_scope}
+            permission: READ
+
+        - name: hf_secret_key
+          secret:
+            key: hf_secret_key
+            scope: ${var.workbench_secret_scope}
+            permission: READ
+
+        # Lakebase project name + branch, needed by the ingest notebook
+        # at runtime to mint its OWN Postgres OAuth token (we deliberately
+        # stopped writing pg_password to the on-volume YAML — leaking a
+        # bearer token to anyone with READ VOLUME was a security smell).
+        - name: lakebase_instance
+          secret:
+            key: lakebase_instance
+            scope: ${var.workbench_secret_scope}
+            permission: READ
+
+        - name: lakebase_branch
+          secret:
+            key: lakebase_branch
+            scope: ${var.workbench_secret_scope}
             permission: READ
