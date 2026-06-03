@@ -529,24 +529,51 @@ export default function Playground({
     if (running) return;
     if (selectedFrames.size === 0) return;
     if (selectedModels.size === 0 && selectedLocalModels.size === 0) return;
+
+    // Delta semantics: keep existing results, only run missing (model,frame)
+    // cells. Common case: user adds a fine-tuned model to a panel that's
+    // already populated for the other models, hits Run, and only the new
+    // model is exercised. To force a full re-run, click "Clear" first.
+    const framePaths = Array.from(selectedFrames);
+    const gatewayMissing: Record<string, string[]> = {};
+    for (const m of selectedModels) {
+      const need = framePaths.filter((p) => !results.has(`${m}::${p.split("/").pop() || p}`));
+      if (need.length > 0) gatewayMissing[m] = need;
+    }
+    const localMissing: Record<string, string[]> = {};
+    for (const m of selectedLocalModels) {
+      const need = framePaths.filter((p) => !results.has(`${m}::${p.split("/").pop() || p}`));
+      if (need.length > 0) localMissing[m] = need;
+    }
+
+    const nGatewayCells = Object.values(gatewayMissing).reduce((a, b) => a + b.length, 0);
+    const nLocalCells = Object.values(localMissing).reduce((a, b) => a + b.length, 0);
+    if (nGatewayCells === 0 && nLocalCells === 0) {
+      // Everything is already filled in. Don't do anything noisy; just
+      // surface a brief signal so the user knows the click did register.
+      setRunDuration(0);
+      return;
+    }
+
     setRunning(true);
-    setResults(new Map());
-    const totalCells =
-      selectedFrames.size * (selectedModels.size + selectedLocalModels.size);
-    setProgress({ done: 0, total: totalCells });
+    setProgress({ done: 0, total: nGatewayCells + nLocalCells });
     setRunError(null);
     setRunDuration(null);
-    setLocalRuns({});
+    // Don't wipe localRuns either — let prior submissions retain their state.
     const t0 = performance.now();
 
-    // 1) AI Gateway models — run in one batched call, results land all at once.
-    if (selectedModels.size > 0) {
-      cancelRef.current = api.playgroundRun(
-        {
-          frame_paths: Array.from(selectedFrames),
-          model_names: Array.from(selectedModels),
-          prompt,
-        },
+    // 1) AI Gateway — issue ONE call per model that has missing frames. The
+    // backend API runs frame_paths × model_names as a cartesian product, so
+    // submitting per-model with each model's own missing-frames list is the
+    // smallest scope we can request.
+    const gatewayEntries = Object.entries(gatewayMissing);
+    let pendingGateway = gatewayEntries.length;
+    if (pendingGateway === 0) {
+      cancelRef.current = null;
+    }
+    for (const [modelName, framesForModel] of gatewayEntries) {
+      api.playgroundRun(
+        { frame_paths: framesForModel, model_names: [modelName], prompt },
         {
           onResponse: (resp) => {
             setResults((cur) => {
@@ -557,42 +584,42 @@ export default function Playground({
               return next;
             });
             setProgress((cur) => cur ? { ...cur, done: cur.done + resp.successful } : cur);
-            setRunDuration(resp.elapsed_s);
-            cancelRef.current = null;
-            // If there are no local jobs, we're done.
+            setRunDuration(Number(((performance.now() - t0) / 1000).toFixed(2)));
+            pendingGateway -= 1;
+            if (pendingGateway === 0) cancelRef.current = null;
             const anyLocal = Object.values(localRuns).some((r) => r.state === "running" || r.state === "submitting");
-            if (!anyLocal && selectedLocalModels.size === 0) setRunning(false);
+            if (pendingGateway === 0 && !anyLocal && Object.keys(localMissing).length === 0) {
+              setRunning(false);
+            }
           },
           onError: (err) => {
             setRunError(err.message);
-            cancelRef.current = null;
-            setRunDuration(Number(((performance.now() - t0) / 1000).toFixed(2)));
-            // Don't kill local jobs already submitted.
+            pendingGateway -= 1;
+            if (pendingGateway === 0) cancelRef.current = null;
             const anyLocal = Object.values(localRuns).some((r) => r.state === "running" || r.state === "submitting");
-            if (!anyLocal) setRunning(false);
+            if (pendingGateway === 0 && !anyLocal) setRunning(false);
           },
         }
       );
-    } else {
-      cancelRef.current = null;
     }
 
-    // 2) Local models — submit each as its own GPU job.
-    const framePaths = Array.from(selectedFrames);
-    Array.from(selectedLocalModels).forEach(async (modelName) => {
+    // 2) Local models — submit one GPU job per model, with only that
+    // model's missing frames (so re-running after a new model is added
+    // doesn't re-process frames the prior run already covered).
+    Object.entries(localMissing).forEach(async ([modelName, framesForModel]) => {
       setLocalRuns((cur) => ({
         ...cur,
         [modelName]: {
           runId: "(submitting)",
           databricksRunId: "",
           modelName,
-          framePaths,
+          framePaths: framesForModel,
           state: "submitting",
           startedAt: Date.now(),
         },
       }));
       try {
-        const r = await api.localRunSubmit({ model_name: modelName, frame_paths: framePaths, prompt });
+        const r = await api.localRunSubmit({ model_name: modelName, frame_paths: framesForModel, prompt });
         setLocalRuns((cur) => ({
           ...cur,
           [modelName]: {
@@ -714,9 +741,17 @@ export default function Playground({
     (selectedModels.size > 0 || selectedLocalModels.size > 0);
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,360px)_1fr]">
+    {/* The right column carries a wide model-results table that can grow
+        well past viewport width when many models are selected. We pin the
+        left panel to a readable 320–360px range and let the right column
+        overflow horizontally inside its own scroll container, instead of
+        the grid squeezing the left panel into a single-character strip
+        (which is what `minmax(0, ...)` does when the right side wants more
+        space than is available). `min-w-0` on the right cell prevents flex
+        children inside from pushing the column wider than the grid track. */}
+    <div className="grid gap-6 lg:grid-cols-[minmax(320px,360px)_minmax(0,1fr)]">
       {/* ─── LEFT COLUMN: selection panel ─────────────────────────────── */}
-      <div className="space-y-4 lg:sticky lg:top-20 lg:self-start">
+      <div className="min-w-0 space-y-4 lg:sticky lg:top-20 lg:self-start">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-base">Frames</CardTitle>
@@ -973,7 +1008,10 @@ export default function Playground({
       </div>
 
       {/* ─── RIGHT COLUMN: prompt + run + results ─────────────────────── */}
-      <div className="space-y-4">
+      {/* `min-w-0` is critical — without it, the inner table's natural
+          width forces the grid track to grow and the left panel collapses
+          again. With it, the table's `overflow-auto` wrapper scrolls. */}
+      <div className="min-w-0 space-y-4">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-base">Prompt</CardTitle>
@@ -1534,8 +1572,13 @@ function ResultsMatrix({
   );
 
   return (
-    <div className="overflow-auto">
-      <table className="w-full border-collapse text-xs">
+    // `w-full max-w-full` pins the scroll container to the parent's width
+    // (the Card's CardContent). Without it, the div sizes to the table's
+    // intrinsic width, blowing past the grid track and pushing the left
+    // panel into the single-character-wide failure mode again. `max-w-full`
+    // is belt-and-suspenders against any ancestor `min-content` inflation.
+    <div className="w-full max-w-full overflow-x-auto">
+      <table className="w-max border-collapse text-xs">
         <thead className="sticky top-0 z-10 bg-card">
           <tr>
             <th className="sticky left-0 z-20 w-32 border-b border-r bg-card p-2 text-left font-medium">

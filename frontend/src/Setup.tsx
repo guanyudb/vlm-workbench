@@ -96,33 +96,41 @@ export default function Setup() {
           <div className="divide-y">
             {checks.map((c) => {
               const isOpen = expanded.has(c.name);
+              // Single inline action lives on the HF row — opening the dialog
+              // there also kicks off the model cache job, so duplicating the
+              // button on the Local model cache row was pure noise.
+              const hasInlineAction = /HuggingFace/i.test(c.name);
               return (
                 <div key={c.name} className="px-4 py-3">
-                  <button
-                    onClick={() => c.remediation && toggle(c.name)}
-                    className={cn(
-                      "flex w-full items-start gap-3 text-left",
-                      c.remediation && !c.ok && "cursor-pointer",
-                    )}
-                  >
-                    {c.ok
-                      ? <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-500" />
-                      : <XCircle className="mt-0.5 size-4 shrink-0 text-destructive" />}
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium">{c.name}</span>
-                        {!c.ok && c.remediation && (
-                          isOpen ? <ChevronDown className="size-3.5 text-muted-foreground" /> : <ChevronRight className="size-3.5 text-muted-foreground" />
-                        )}
+                  <div className="flex w-full items-start gap-3">
+                    <button
+                      onClick={() => c.remediation && toggle(c.name)}
+                      className={cn(
+                        "flex flex-1 items-start gap-3 text-left",
+                        c.remediation && !c.ok && "cursor-pointer",
+                      )}
+                    >
+                      {c.ok
+                        ? <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-500" />
+                        : <XCircle className="mt-0.5 size-4 shrink-0 text-destructive" />}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm font-medium">{c.name}</span>
+                          {!c.ok && c.remediation && (
+                            isOpen ? <ChevronDown className="size-3.5 text-muted-foreground" /> : <ChevronRight className="size-3.5 text-muted-foreground" />
+                          )}
+                        </div>
+                        <p className={cn(
+                          "mt-0.5 text-xs",
+                          c.ok ? "text-muted-foreground" : "text-destructive",
+                        )}>
+                          {c.detail || "—"}
+                        </p>
                       </div>
-                      <p className={cn(
-                        "mt-0.5 text-xs",
-                        c.ok ? "text-muted-foreground" : "text-destructive",
-                      )}>
-                        {c.detail || "—"}
-                      </p>
-                    </div>
-                  </button>
+                    </button>
+                    {/* Always-available action button — works whether the check is green or red */}
+                    {hasInlineAction && <HFTokenDialog onSaved={refresh} compact />}
+                  </div>
                   {isOpen && c.remediation && (
                     <div className="ml-7 mt-2 rounded-md border bg-muted/40 p-3 text-xs">
                       <div className="mb-1 flex items-center gap-1 font-medium text-foreground">
@@ -140,9 +148,6 @@ export default function Setup() {
                         >
                           <ExternalLink className="size-3" /> Docs
                         </a>
-                      )}
-                      {/HuggingFace/i.test(c.name) && (
-                        <HFTokenDialog onSaved={refresh} />
                       )}
                     </div>
                   )}
@@ -204,27 +209,60 @@ export default function Setup() {
 
 // ── HF token paste dialog ────────────────────────────────────────────────
 //
-// Posts the token to /api/setup/hf-token, which writes it to the workspace's
-// configured hf_secret_scope/key. App SP must have WRITE on the scope —
-// postdeploy.py tries to grant that automatically when the deployer owns
-// the scope; if not, the API returns 403 and the dialog surfaces the error.
-function HFTokenDialog({ onSaved }: { onSaved: () => void }) {
+// Posts the token to /api/setup/hf-token. The endpoint creates the scope if
+// it doesn't exist (App SP becomes the owner), writes the token, and — if
+// `models` is non-empty — kicks off a setup_cache job to download those
+// weights into the Volume. Token + model selection are paired in one
+// dialog because HF tokens are needed to unlock gated repos like MedGemma.
+function HFTokenDialog({ onSaved, compact }: { onSaved: () => void; compact?: boolean }) {
   const [open, setOpen] = useState(false);
   const [token, setToken] = useState("");
+  const [presets, setPresets] = useState<{ name: string; hf_repo: string; label: string }[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [ok, setOk] = useState<string | null>(null);
+  const [okMsg, setOkMsg] = useState<string | null>(null);
+  const [runUrl, setRunUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open && presets.length === 0) {
+      api.getLocalModelPresets()
+        .then((r) => {
+          setPresets(r.presets);
+          setSelected(new Set(r.presets.map((p) => p.name)));  // default: cache all
+        })
+        .catch(() => { /* presets are optional */ });
+    }
+  }, [open]);
+
+  const toggle = (name: string) => {
+    setSelected((s) => {
+      const next = new Set(s);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
 
   const save = async () => {
     setSaving(true);
     setErr(null);
-    setOk(null);
+    setOkMsg(null);
+    setRunUrl(null);
     try {
-      const r = await api.storeHFToken(token.trim());
-      setOk(`stored in scope=${r.scope}, key=${r.key} (${r.len} chars)`);
+      const models = presets
+        .filter((p) => selected.has(p.name))
+        .map((p) => ({ name: p.name, hf_repo: p.hf_repo }));
+      const r = await api.storeHFToken(token.trim(), models.length ? models : undefined);
+      const partials: string[] = [`token stored in ${r.scope}/${r.key} (${r.len} chars)`];
+      if (r.models_run_id) {
+        partials.push(`caching ${models.length} model(s) — run ${r.models_run_id}`);
+        if (r.models_run_url) setRunUrl(r.models_run_url);
+      }
+      if (r.models_error) partials.push(`models error: ${r.models_error}`);
+      setOkMsg(partials.join(" · "));
       setToken("");
       onSaved();
-      setTimeout(() => setOpen(false), 1500);
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -234,33 +272,80 @@ function HFTokenDialog({ onSaved }: { onSaved: () => void }) {
 
   return (
     <>
-      <Button size="sm" className="mt-3" onClick={() => setOpen(true)}>
-        Set token in-app
-      </Button>
+      {compact ? (
+        <Button variant="outline" size="sm" className="shrink-0" onClick={() => setOpen(true)}>
+          Set token / cache
+        </Button>
+      ) : (
+        <Button size="sm" className="mt-3" onClick={() => setOpen(true)}>
+          Set token in-app
+        </Button>
+      )}
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-w-lg">
           <DialogHeader>
-            <DialogTitle>HuggingFace token</DialogTitle>
+            <DialogTitle>HuggingFace token + model cache</DialogTitle>
             <DialogDescription>
-              Pasted directly into the workspace secret scope this App is bound to. We never log it. Get one from <a className="text-primary underline" href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer">huggingface.co/settings/tokens</a>.
+              Pasted into the workspace secret scope this App owns. We never log it. Get one from{" "}
+              <a className="text-primary underline" href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer">huggingface.co/settings/tokens</a>.
+              Models you check below will start downloading to the Volume immediately so they're ready in the Playground's Local section.
             </DialogDescription>
           </DialogHeader>
-          <Input
-            type="password"
-            placeholder="hf_..."
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            spellCheck={false}
-            autoFocus
-          />
-          {err && <p className="text-xs text-destructive">{err}</p>}
-          {ok && <p className="text-xs text-emerald-600">{ok}</p>}
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs font-medium">HF token</label>
+              <Input
+                type="password"
+                placeholder="hf_..."
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                spellCheck={false}
+                autoFocus
+                className="mt-1"
+              />
+            </div>
+            {presets.length > 0 && (
+              <div>
+                <label className="text-xs font-medium">Cache these models now (optional)</label>
+                <div className="mt-2 space-y-1.5 rounded-md border bg-muted/30 px-3 py-2">
+                  {presets.map((p) => (
+                    <label key={p.name} className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(p.name)}
+                        onChange={() => toggle(p.name)}
+                        className="size-3.5"
+                      />
+                      <span className="font-medium">{p.label}</span>
+                      <code className="text-[10px] text-muted-foreground">{p.hf_repo}</code>
+                    </label>
+                  ))}
+                </div>
+                <p className="mt-1 text-[10px] text-muted-foreground">
+                  Each model is multi-GB and takes 5–30min to snapshot. The job runs in the background; close this dialog after click and watch progress in the Workflow run.
+                </p>
+              </div>
+            )}
+            {err && <p className="text-xs text-destructive">{err}</p>}
+            {okMsg && (
+              <p className="text-xs text-emerald-600">
+                {okMsg}
+                {runUrl && (
+                  <>
+                    {" · "}
+                    <a className="underline" href={runUrl} target="_blank" rel="noopener noreferrer">open run</a>
+                  </>
+                )}
+              </p>
+            )}
+          </div>
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline" size="sm">Cancel</Button>
+              <Button variant="outline" size="sm">Close</Button>
             </DialogClose>
             <Button size="sm" disabled={!token.trim() || saving} onClick={save}>
-              {saving ? <Loader2 className="size-3 animate-spin" /> : null} Save
+              {saving ? <Loader2 className="size-3 animate-spin" /> : null}
+              {selected.size > 0 ? `Save + cache ${selected.size}` : "Save token"}
             </Button>
           </DialogFooter>
         </DialogContent>

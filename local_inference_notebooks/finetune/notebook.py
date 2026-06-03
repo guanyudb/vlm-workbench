@@ -90,7 +90,10 @@ print(f"[ft] output_dir: {OUTPUT_DIR}")
 # HF token: gives us access to gated repos like Qwen3-VL/MedGemma when
 # transformers wants to validate the tokenizer config against HF.
 try:
-    hf_scope = cfg.get("hf_secret_scope", "hls_g4")
+    # Defaults match the workbench's per-deploy scope name. The app threads
+    # the actual configured values in via cfg — the defaults only matter for
+    # standalone notebook runs.
+    hf_scope = cfg.get("hf_secret_scope", "vlmwb_hf")
     hf_key = cfg.get("hf_secret_key", "HF_TOKEN")
     os.environ["HF_TOKEN"] = dbutils.secrets.get(hf_scope, hf_key)
 except Exception as e:

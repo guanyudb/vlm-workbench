@@ -435,6 +435,79 @@ def _download_bytes(path: str) -> bytes:
 
 # ── Health ────────────────────────────────────────────────────────────────
 
+# ── Global runs tracker ──────────────────────────────────────────────────
+# Lists every workbench-submitted Databricks Job run from the last 24h so
+# the React navbar pill can show in-flight + recent runs across all tabs
+# (Library ingest, Setup cache, Optimize, Train) in one place.
+
+# Map run_name prefix → human-readable kind shown in the UI.
+# Every workbench-submitted run gets a `vlmwb_` prefix so the runs pill
+# doesn't surface unrelated workflows in shared workspaces (e.g., other
+# users' `ingest_confluence_*` jobs were polluting the list).
+_RUN_KIND_PATTERNS = [
+    ("vlmwb_ingest_",        "ingest"),
+    ("vlmwb_setup_cache_",   "cache"),
+    ("vlmwb_optimize_gepa_", "optimize"),
+    ("vlmwb_optimize_dspy_", "optimize"),
+    ("vlmwb_finetune_",      "train"),
+    ("vlmwb_repin_",         "repin"),
+    ("vlmwb_local_",         "local-inference"),
+]
+
+
+def _infer_run_kind(run_name: str) -> str:
+    n = (run_name or "").lower()
+    for prefix, kind in _RUN_KIND_PATTERNS:
+        if n.startswith(prefix):
+            return kind
+    return "other"
+
+
+@app.get("/api/runs/active")
+def list_runs():
+    """Recent workbench-submitted runs (active + finished in the last 24h).
+    Filters by `run_name` prefix patterns so we don't surface unrelated
+    runs from other workspace users. The SDK doesn't expose a
+    `run_as_user_name` filter at this version, so name-prefix filtering
+    is the only practical guard in a shared workspace."""
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+    since = int((time.time() - 24 * 3600) * 1000)
+    host = (os.environ.get("DATABRICKS_HOST") or "").rstrip("/")
+    sp = os.environ.get("DATABRICKS_CLIENT_ID") or ""
+    out: List[Dict[str, object]] = []
+    try:
+        # limit=25 is the Jobs API per-page cap; iterator paginates as needed.
+        for r in w.jobs.list_runs(limit=25, start_time_from=since):
+            name = r.run_name or ""
+            kind = _infer_run_kind(name)
+            if kind == "other":
+                continue
+            # Originally I added a "creator must be this SP" guard here, but
+            # `run_as_user_name` for an Apps SP is its display name (e.g.
+            # `app-40zbx9 vlm-workbench`), not the UUID — so checking for the
+            # client_id substring excluded every legitimate run. The
+            # `run_name`-prefix filter (above) already prevents leakage of
+            # unrelated jobs in shared workspaces; rely on that alone.
+            s = r.state
+            life = (s.life_cycle_state.value if s and s.life_cycle_state else "") or ""
+            res = (s.result_state.value if s and s.result_state else "") or ""
+            out.append({
+                "run_id": r.run_id,
+                "name": name,
+                "kind": kind,
+                "life_cycle_state": life,
+                "result_state": res,
+                "state_message": (s.state_message if s else None),
+                "start_time": r.start_time,
+                "end_time": r.end_time,
+                "run_url": f"{host}/#job/runs/{r.run_id}" if host else None,
+            })
+    except Exception as e:
+        log.warning(f"list_runs failed: {e}")
+    return {"runs": out, "fetched_at": int(time.time() * 1000)}
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -464,23 +537,42 @@ class TaskConfigIn(BaseModel):
     prompt_template: str
 
 
+class HFModelSpec(BaseModel):
+    name: str            # slug used for the directory + manifest
+    hf_repo: str         # Hugging Face repo id (e.g. "Qwen/Qwen3-VL-8B-Instruct")
+    revision: Optional[str] = "main"
+
+
 class HFTokenIn(BaseModel):
     token: str
+    models: Optional[List[HFModelSpec]] = None  # if present, kick off setup_cache job
+
+
+# Preset model catalogue surfaced to the Setup tab so the UI doesn't need
+# to hardcode HF repo paths. Add new entries here as more local-served
+# models become useful.
+LOCAL_MODEL_PRESETS: List[Dict[str, str]] = [
+    {"name": "qwen3-vl-8b",   "hf_repo": "Qwen/Qwen3-VL-8B-Instruct", "label": "Qwen3-VL-8B (Apache-2.0)"},
+    {"name": "medgemma-4b-it","hf_repo": "google/medgemma-4b-it",     "label": "MedGemma-4B-it (gated)"},
+]
+
+
+@app.get("/api/setup/local-model-presets")
+def get_local_model_presets():
+    """Catalogue of model presets the Setup tab offers to cache. Each entry
+    has (name, hf_repo, label). The HF token paste dialog uses these to
+    render checkboxes."""
+    return {"presets": LOCAL_MODEL_PRESETS}
 
 
 @app.post("/api/setup/hf-token")
 def store_hf_token(req: HFTokenIn):
-    """Write the user's HuggingFace token into the configured scope/key so
-    Local models (Qwen3-VL, MedGemma, …) can be downloaded by the
-    setup_cache notebook. The App SP needs WRITE on the scope — grant comes
-    from postdeploy.py's `_grant_secret_write`.
+    """Write the user's HF token into the configured scope/key, creating
+    the scope if it doesn't exist yet (App SP owns the scope it creates,
+    so subsequent put_secret succeeds). If `models` is non-empty, also
+    kick off the setup_cache job to download those weights to the Volume.
 
-    The scope name + key are workspace-specific values exposed by the DAB's
-    secret bindings (HF_SECRET_SCOPE / HF_SECRET_KEY env vars); if the bound
-    scope is owned by a different team (e.g., the shared `hf` scope on
-    e2-demo-field-eng), the write will 403 — the UI surfaces that as a hint
-    to either request WRITE on the existing scope or point variable-overrides
-    at a user-owned scope."""
+    Returns {ok, scope, key, len, models_run_id?, models_run_url?}."""
     tok = (req.token or "").strip()
     if not tok:
         raise HTTPException(400, "token is empty")
@@ -490,20 +582,72 @@ def store_hf_token(req: HFTokenIn):
     key = HF_SECRET_KEY
     if not scope or not key:
         raise HTTPException(503, "HF scope/key not configured — set hf_secret_scope and hf_secret_key in variable-overrides.json")
+
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+
+    # Ensure scope exists. If the deployer pre-owns it, we just put. If it
+    # doesn't exist yet, App SP creates it (and becomes owner — so the
+    # subsequent put + grant succeed without admin help).
     try:
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
+        existing = {s.name for s in w.secrets.list_scopes()}
+    except Exception as e:
+        raise HTTPException(500, f"could not list secret scopes: {e}")
+    if scope not in existing:
+        try:
+            w.secrets.create_scope(scope=scope)
+        except Exception as e:
+            raise HTTPException(500, f"could not create scope '{scope}': {e}")
+
+    try:
         w.secrets.put_secret(scope=scope, key=key, string_value=tok)
     except Exception as e:
         msg = str(e)
         if "403" in msg or "PERMISSION" in msg.upper():
             raise HTTPException(403,
-                f"App SP can't write to scope '{scope}'. Either grant the SP WRITE on "
-                f"the scope, or point hf_secret_scope in variable-overrides.json at a "
-                f"scope you own. Underlying error: {e}")
+                f"App SP can't write to scope '{scope}'. Either grant the SP WRITE "
+                f"on the scope, or point hf_secret_scope in variable-overrides.json "
+                f"at a scope you own. Underlying error: {e}")
         log.exception("hf token put failed")
         raise HTTPException(500, f"put failed: {e}")
-    return {"ok": True, "scope": scope, "key": key, "len": len(tok)}
+
+    out: Dict[str, object] = {"ok": True, "scope": scope, "key": key, "len": len(tok)}
+
+    # Optional: kick off setup_cache job for the selected models
+    if req.models:
+        try:
+            notebook_path = _resolve_setup_cache_notebook()
+            models_json = json.dumps([m.dict() for m in req.models])
+            body = {
+                "run_name": f"vlmwb_setup_cache_{int(time.time())}",
+                "tasks": [{
+                    "task_key": "cache",
+                    "notebook_task": {
+                        "notebook_path": notebook_path,
+                        "source": "WORKSPACE",
+                        "base_parameters": {
+                            "local_models_dir": LOCAL_MODELS_DIR,
+                            "hf_secret_scope": scope,
+                            "hf_secret_key": key,
+                            "models_json": models_json,
+                        },
+                    },
+                    "environment_key": "cpu_env",
+                }],
+                "environments": [{"environment_key": "cpu_env", "spec": {"environment_version": "5"}}],
+                "queue": {"enabled": True},
+            }
+            host = (os.environ.get("DATABRICKS_HOST") or "").rstrip("/")
+            run = w.api_client.do("POST", "/api/2.2/jobs/runs/submit", body=body)
+            run_id = run.get("run_id") if isinstance(run, dict) else None
+            out["models_run_id"] = run_id
+            out["models_run_url"] = f"{host}/#job/runs/{run_id}" if run_id and host else None
+            out["models"] = [m.dict() for m in req.models]
+        except Exception as e:
+            log.exception("setup_cache submit failed")
+            out["models_error"] = f"{type(e).__name__}: {e}"
+
+    return out
 
 
 @app.put("/api/task-config")
@@ -767,9 +911,10 @@ def setup_check():
             ok=len(ready) > 0,
             detail=f"{len(ready)} ready of {all_count} (in {LOCAL_MODELS_DIR})",
             remediation=(
-                "Run the `setup_cache` notebook with `hf_token` widget set (or with the "
-                "hls_g4/HF_TOKEN secret accessible). It snapshots weights from HF into "
-                "the Volume."
+                "Open the HuggingFace token check below → click 'Set token in-app' → "
+                "paste your HF token and check the models you want to cache. The "
+                "setup_cache job downloads weights from HF into the Volume; ~5–30 min "
+                "depending on model size and network."
             ) if len(ready) == 0 else None,
         ))
     except Exception as e:
@@ -779,33 +924,38 @@ def setup_check():
             detail=str(e)[:200],
         ))
 
-    # 6. HF token secret — needed for gated model downloads (MedGemma, MedGemma-cataract)
+    # 6. HF token secret — check the configured scope (HF_SECRET_SCOPE), not
+    # whichever happens to be alphabetically-first with "hf" in the name.
     try:
         w = _workspace()
         scopes = [s.name for s in w.secrets.list_scopes()]
-        # Take a best-guess: the workbench app passes hf_secret_scope as a binding,
-        # but at runtime we don't have direct access to its name. The notebooks
-        # default to `hls_g4`. Probe that, plus any with `hf` in the name.
-        candidates = ["hls_g4"] + [s for s in scopes if "hf" in s.lower()]
-        candidates = list(dict.fromkeys(candidates))
-        found = [s for s in candidates if s in scopes]
-        if not found:
-            raise RuntimeError(f"no HF scope candidate visible (looked for: {candidates})")
+        target_scope = HF_SECRET_SCOPE or ""
+        target_key = HF_SECRET_KEY or ""
+        if not target_scope:
+            raise RuntimeError("HF_SECRET_SCOPE not set — check resources/app.yml binding")
+        if target_scope not in scopes:
+            raise RuntimeError(
+                f"configured HF scope `{target_scope}` does not exist. Click "
+                f"'Set token in-app' below to create it + paste a token."
+            )
+        # Check whether the token secret actually exists (not just the scope)
+        existing_keys = [k.key for k in w.secrets.list_secrets(scope=target_scope)]
+        if target_key not in existing_keys:
+            raise RuntimeError(
+                f"scope `{target_scope}` exists but key `{target_key}` is missing. "
+                f"Click 'Set token in-app' below to paste a token."
+            )
         # Probe ACL — we want to know if SP has READ
         sp = os.environ.get("DATABRICKS_CLIENT_ID")
+        detail = f"scope `{target_scope}` · key `{target_key}` present"
         if sp:
             try:
-                acls = w.secrets.list_acls(scope=found[0])
+                acls = w.secrets.list_acls(scope=target_scope)
                 sp_acl = next((a for a in acls if a.principal == sp), None)
                 if sp_acl:
-                    detail = f"scope `{found[0]}` · SP has {sp_acl.permission}"
-                else:
-                    raise RuntimeError(f"App SP not in ACL of scope `{found[0]}`")
-            except Exception as inner:
-                # ACL lookup needs MANAGE on the scope; fall back to existence-only
-                detail = f"scope `{found[0]}` exists (ACL probe: {str(inner)[:100]})"
-        else:
-            detail = f"scope `{found[0]}` exists"
+                    detail = f"scope `{target_scope}` · key `{target_key}` · SP has {sp_acl.permission}"
+            except Exception:
+                pass  # MANAGE needed for list_acls; existence-only is fine
         checks.append(SetupCheck(
             name="HuggingFace token secret",
             ok=True,
@@ -858,7 +1008,46 @@ def setup_check():
             detail=f"{len(notebook_resolvers)}/{len(notebook_resolvers)} resolve cleanly",
         ))
 
-    # 8. MLflow GenAI auth path (UC-managed prompts/datasets)
+    # 8. MLflow experiment (workspace-level run tracking, separate from UC prompts).
+    # Default is under the SP's own home (/Users/<sp_uuid>/vlmwb-experiments)
+    # which the SP owns implicitly. If the operator overrode MLFLOW_EXPERIMENT_PATH
+    # to a different folder, the SP needs CAN_MANAGE on it. We exercise the full
+    # flow (create-or-get + start_run + log_param + end_run) to catch every gate.
+    try:
+        with _mlflow_auth_scope():
+            import mlflow
+            mlflow.set_tracking_uri("databricks")
+            exp = mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
+            exp_id = getattr(exp, "experiment_id", None)
+            # Quick write probe — start_run/log_param/end_run all hit the
+            # tracking server with the SP's identity.
+            with mlflow.start_run(experiment_id=exp_id, run_name="vlmwb_setup_probe", nested=False) as run:
+                mlflow.log_param("probe", "ok")
+            detail = f"experiment `{MLFLOW_EXPERIMENT_PATH}` (id={exp_id}) writable"
+        checks.append(SetupCheck(
+            name="MLflow experiment",
+            ok=True,
+            detail=detail,
+        ))
+    except Exception as e:
+        checks.append(SetupCheck(
+            name="MLflow experiment",
+            ok=False,
+            detail=str(e)[:200],
+            remediation=(
+                f"App SP needs CAN_MANAGE on the experiment folder `{MLFLOW_EXPERIMENT_PATH}`. "
+                f"By default we put the experiment under the SP's own home "
+                f"(/Users/<sp_client_id>/vlmwb-experiments) which the SP owns — no action "
+                f"needed there. If MLFLOW_EXPERIMENT_PATH was overridden to a folder under "
+                f"a user's home, that user must:\n"
+                f"  1. Create the folder if missing (Workspace UI → New → Folder)\n"
+                f"  2. Share with the App SP (Workspace UI → ⋯ → Permissions → "
+                f"Add `{os.environ.get('DATABRICKS_CLIENT_ID', '<sp_client_id>')}` with "
+                f"`Can Manage`)"
+            ),
+        ))
+
+    # 9. MLflow GenAI auth path (UC-managed prompts/datasets)
     try:
         with _mlflow_auth_scope():
             import mlflow
@@ -948,20 +1137,30 @@ class VideoEntry(BaseModel):
 
 @app.get("/api/videos", response_model=List[VideoEntry])
 def list_videos():
-    """List .mp4 files in the configured volume path."""
+    """List videos that have been ingested into Lakebase.
+
+    Lakebase's `videos` table is the single source of truth — it's
+    populated by the Library tab's ingest pipeline and contains only
+    videos that have been (or are being) frame-extracted. Studio,
+    Playground, and every other consumer should read from here so
+    the views stay consistent across tabs. Image batches (`kind='image_batch'`)
+    are excluded — Studio is video-only."""
     out: List[VideoEntry] = []
-    for entry in _ls_dir(VOLUME_PATH):
-        name = entry["name"]
-        if not name or entry["is_directory"]:
-            continue
-        if not name.lower().endswith(".mp4"):
-            continue
-        out.append(VideoEntry(
-            name=name,
-            path=str(entry["path"] or os.path.join(VOLUME_PATH, name)),
-            size_bytes=int(entry["size_bytes"]),
-        ))
-    out.sort(key=lambda v: v.name)
+    if not _lakebase_available():
+        return out
+    try:
+        _ensure_ingest_tables()
+        with _pg_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT name, path, COALESCE(size_bytes, 0)
+                FROM videos
+                WHERE kind = 'video' AND status = 'ready'
+                ORDER BY name
+            """)
+            for name, path, size_bytes in cur.fetchall():
+                out.append(VideoEntry(name=name, path=path, size_bytes=int(size_bytes)))
+    except Exception as e:
+        log.warning(f"list_videos from Lakebase failed: {e}")
     return out
 
 
@@ -1436,7 +1635,7 @@ class LocalModelEntry(BaseModel):
     name: str                # subdir name, also the canonical id
     display_name: str
     hf_repo: str
-    accelerator: str         # GPU_A10 | GPU_8xH100 | ...
+    accelerator: str         # GPU_1xA10 | GPU_8xH100 | ... (NOT GPU_A10 — silently maps to CPU)
     snapshot_dir: Optional[str]  # path to cached weights, None if not yet downloaded
     ready: bool              # True if snapshot dir exists and is non-empty
     notes: Optional[str] = None
@@ -1482,7 +1681,7 @@ def list_local_models():
             name=cfg.get("name", name),
             display_name=cfg.get("display_name", name),
             hf_repo=cfg.get("hf_repo", ""),
-            accelerator=cfg.get("accelerator", "GPU_A10"),
+            accelerator=cfg.get("accelerator", "GPU_1xA10"),
             snapshot_dir=snapshot_dir if ready else None,
             ready=ready,
             notes=(cfg.get("notes") or "").strip() or None,
@@ -1527,7 +1726,7 @@ def submit_local_run(req: LocalRunRequest):
         raise
     except Exception:
         raise HTTPException(409, f"model '{req.model_name}' snapshot dir unreachable")
-    accelerator = manifest.get("accelerator", "GPU_A10")
+    accelerator = manifest.get("accelerator", "GPU_1xA10")
     base_environment = manifest.get("base_environment", "databricks_ai_v4")
 
     run_id = f"local_{int(time.time())}_{req.model_name.replace('/', '_')}"
@@ -1561,7 +1760,7 @@ def submit_local_run(req: LocalRunRequest):
     # `environment_version: "5"` here silently lands on a CPU image (no torch),
     # which manifests as multi-minute hangs followed by ModuleNotFoundError.
     body = {
-        "run_name": f"local_{req.model_name}_{run_id}",
+        "run_name": f"vlmwb_local_{req.model_name}_{run_id}",
         "tasks": [{
             "task_key": "infer",
             "notebook_task": {
@@ -1754,18 +1953,28 @@ def kick_off_finetune(req: FineTuneRequest):
             if not row:
                 raise HTTPException(404, f"snapshot {req.snapshot_id} not found")
             snapshot_frame_paths = row[0] or []
+    # INNER JOIN on extracted_frames_index so we only train on labels whose
+    # frames still physically exist on the Volume. Re-ingest replaces the
+    # frame set for a video — orphaned labels (pointing at deleted JPGs)
+    # would otherwise break the training job with FileNotFoundError. Lakebase
+    # is the single source of truth: extracted_frames_index is the index of
+    # what's currently on disk, frame_labels is the human gold-truth layer
+    # on top of it, and we always intersect when reading for downstream use.
     with _pg_conn() as conn, conn.cursor() as cur:
-        clauses, params = [], []
+        clauses, params = ["efi.frame_path IS NOT NULL"], []
         if req.label_filter_instruments:
-            clauses.append("instrument = ANY(%s)")
+            clauses.append("fl.instrument = ANY(%s)")
             params.append(req.label_filter_instruments)
         if snapshot_frame_paths is not None:
-            clauses.append("frame_path = ANY(%s)")
+            clauses.append("fl.frame_path = ANY(%s)")
             params.append(snapshot_frame_paths)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = " WHERE " + " AND ".join(clauses)
         cur.execute(
-            f"SELECT frame_path, instrument, anatomy, tissue_condition "
-            f"FROM frame_labels{where} ORDER BY created_at",
+            f"SELECT fl.frame_path, fl.instrument, fl.anatomy, fl.tissue_condition "
+            f"FROM frame_labels fl "
+            f"INNER JOIN extracted_frames_index efi ON efi.frame_path = fl.frame_path"
+            f"{where} "
+            f"ORDER BY fl.created_at",
             tuple(params),
         )
         rows = cur.fetchall()
@@ -1824,7 +2033,7 @@ def kick_off_finetune(req: FineTuneRequest):
 
     notebook_path = _resolve_finetune_notebook()
     body = {
-        "run_name": f"finetune_{run_id}",
+        "run_name": f"vlmwb_finetune_{run_id}",
         "tasks": [{
             "task_key": "finetune",
             "notebook_task": {
@@ -1959,24 +2168,34 @@ class DeployableModel(BaseModel):
 def list_deployable_models():
     """List UC models in the workbench's catalog.schema. Pulls every model
     version + cross-references with MLflow runs so the UI can show base_model
-    and training metadata."""
+    and training metadata.
+
+    IMPLEMENTATION NOTE: MLflow's `search_registered_models(filter_string=...)`
+    is NOT supported for UC-managed models — calling it with a filter raises
+    `MlflowException: Argument 'filter_string' is unsupported for models in
+    the Unity Catalog.` And the unfiltered version paginates against the
+    workspace's entire registry, so models in our schema may not appear in
+    the first page. Use the UC REST API directly to scope the query.
+    """
     out: List[DeployableModel] = []
     try:
         import mlflow
-        from databricks.sdk.service.catalog import RegisteredModelsAPI
         mlflow.set_tracking_uri("databricks")
         mlflow.set_registry_uri("databricks-uc")
         client = mlflow.tracking.MlflowClient()
-        # Use a search filter to limit to our catalog.schema
-        filter_str = f"catalog_name='{UC_CATALOG}' AND schema_name='{UC_SCHEMA}'"
-        # MLflowClient supports searching registered models in UC
+        w = _workspace()
+        # UC REST: GET /api/2.1/unity-catalog/models?catalog_name=...&schema_name=...
         try:
-            models = client.search_registered_models(filter_string=filter_str, max_results=100)
-        except Exception:
-            # Older MLflow SDKs use a different signature
-            models = client.search_registered_models(max_results=100)
-        for m in models:
-            full = m.name
+            uc_resp = w.api_client.do(
+                "GET", "/api/2.1/unity-catalog/models",
+                query={"catalog_name": UC_CATALOG, "schema_name": UC_SCHEMA, "max_results": 100},
+            )
+            uc_models = (uc_resp or {}).get("registered_models", [])
+        except Exception as e:
+            log.warning(f"UC models query failed: {e}")
+            uc_models = []
+        for uc in uc_models:
+            full = uc.get("full_name") or f"{UC_CATALOG}.{UC_SCHEMA}.{uc.get('name','')}"
             if not full.startswith(f"{UC_CATALOG}.{UC_SCHEMA}."):
                 continue
             short = full.rsplit(".", 1)[-1]
@@ -2263,7 +2482,7 @@ def repin_model_requirements(req: RepinRequest):
         raise HTTPException(500, f"yaml upload failed: {e}")
 
     body = {
-        "run_name": f"repin_{run_id}",
+        "run_name": f"vlmwb_repin_{run_id}",
         "tasks": [{
             "task_key": "repin",
             "notebook_task": {
@@ -2598,7 +2817,7 @@ def kick_off_optimize(req: OptimizeRequest):
         accelerator = local_manifest.get("accelerator", "GPU_1xA10")
         base_environment = local_manifest.get("base_environment", "databricks_ai_v4")
         body = {
-            "run_name": f"optimize_{req.optimizer}_{run_id}",
+            "run_name": f"vlmwb_optimize_{req.optimizer}_{run_id}",
             "tasks": [{
                 "task_key": "optimize",
                 "notebook_task": {
@@ -2618,7 +2837,7 @@ def kick_off_optimize(req: OptimizeRequest):
         }
     else:
         body = {
-            "run_name": f"optimize_{req.optimizer}_{run_id}",
+            "run_name": f"vlmwb_optimize_{req.optimizer}_{run_id}",
             "tasks": [{
                 "task_key": "optimize",
                 "notebook_task": {
@@ -2750,10 +2969,42 @@ class SnapshotSummary(BaseModel):
     created_by: Optional[str]
 
 
+_SNAPSHOTS_TABLE_READY = False
+
+
+def _ensure_snapshots_table():
+    """Lazily create the snapshots table on first save. Idempotent."""
+    global _SNAPSHOTS_TABLE_READY
+    if _SNAPSHOTS_TABLE_READY:
+        return
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                name         text NOT NULL,
+                notes        text,
+                frame_paths  text[] NOT NULL,
+                model_names  text[] NOT NULL,
+                prompt       text NOT NULL,
+                best_model   text,
+                results      jsonb NOT NULL DEFAULT '[]'::jsonb,
+                elapsed_s    double precision,
+                created_by   text,
+                created_at   timestamptz NOT NULL DEFAULT now()
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS snapshots_created_at_idx "
+            "ON snapshots (created_at DESC)"
+        )
+    _SNAPSHOTS_TABLE_READY = True
+
+
 @app.post("/api/playground/snapshots", response_model=dict)
 def save_snapshot(snap: SnapshotIn):
     if not _lakebase_available():
         raise HTTPException(503, "Lakebase not configured — snapshots require Postgres")
+    _ensure_snapshots_table()
     created_by = os.environ.get("DATABRICKS_USER_EMAIL") or "vlm-workbench"
     try:
         with _pg_conn() as conn, conn.cursor() as cur:
@@ -2777,6 +3028,7 @@ def save_snapshot(snap: SnapshotIn):
 def list_snapshots(limit: int = 30):
     if not _lakebase_available():
         return []
+    _ensure_snapshots_table()
     try:
         with _pg_conn() as conn, conn.cursor() as cur:
             cur.execute("""
@@ -2805,6 +3057,7 @@ def list_snapshots(limit: int = 30):
 def get_snapshot(snapshot_id: str):
     if not _lakebase_available():
         raise HTTPException(404, "no snapshot store")
+    _ensure_snapshots_table()
     try:
         with _pg_conn() as conn, conn.cursor() as cur:
             cur.execute("""
@@ -3476,6 +3729,39 @@ def _resolve_ingest_notebook() -> str:
     return target_path
 
 
+def _resolve_setup_cache_notebook() -> str:
+    """Mirror of _resolve_ingest_notebook for the setup_cache notebook.
+    Imports the source under the App SP's home so the SP can run it."""
+    cache_key = "setup_cache"
+    if cache_key in _NOTEBOOK_CACHE:
+        return _NOTEBOOK_CACHE[cache_key]
+    base_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "local_inference_notebooks", "setup_cache",
+    )
+    candidates = [os.path.join(base_dir, "notebook.py"), os.path.join(base_dir, "notebook")]
+    src_path = next((p for p in candidates if os.path.exists(p)), None)
+    if not src_path:
+        raise RuntimeError(f"setup_cache notebook missing in {base_dir}")
+    with open(src_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode("ascii")
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.workspace import ImportFormat, Language
+    w = WorkspaceClient()
+    target_dir = f"{_sp_home()}/local_inference_notebooks/setup_cache"
+    target_path = f"{target_dir}/notebook"
+    w.workspace.mkdirs(target_dir)
+    w.workspace.import_(
+        path=target_path,
+        format=ImportFormat.SOURCE,
+        language=Language.PYTHON,
+        content=content_b64,
+        overwrite=True,
+    )
+    _NOTEBOOK_CACHE[cache_key] = target_path
+    return target_path
+
+
 def _list_inbox_videos() -> List[Dict[str, object]]:
     """List MP4 files in the inbox via the Files API. Returns name + path + size."""
     out: List[Dict[str, object]] = []
@@ -3768,7 +4054,7 @@ def kick_off_ingest(req: IngestRequest):
             continue
 
         body = {
-            "run_name": f"ingest_{video_stem}",
+            "run_name": f"vlmwb_ingest_{video_stem}",
             "tasks": [{
                 "task_key": "ingest",
                 "notebook_task": {

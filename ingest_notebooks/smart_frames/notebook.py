@@ -60,6 +60,16 @@ PG_ENDPOINT = cfg.get("pg_endpoint", "")  # e.g. projects/vlm/branches/productio
 PG_INSTANCE = cfg.get("pg_instance", "")  # for legacy Provisioned fallback
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Clear any frames from a prior ingest so re-running with new
+# candidate_fps/max_frames doesn't accumulate stale picks alongside the
+# new ones. Lakebase's `extracted_frames_index` is also re-keyed below
+# (DELETE WHERE video_id, then re-INSERT).
+import glob as _glob
+for _stale in _glob.glob(f"{OUTPUT_DIR}/*.jpg"):
+    try:
+        os.remove(_stale)
+    except Exception:
+        pass
 print(f"[ingest] video={VIDEO_NAME} video_id={VIDEO_ID}")
 print(f"[ingest] output={OUTPUT_DIR}  candidate_fps={CANDIDATE_FPS}  max_frames={MAX_FRAMES}")
 
@@ -195,21 +205,26 @@ try:
         c["contrast_rank"] = ct
         c["score"] = 0.45 * s + 0.25 * co + 0.30 * ct
 
-    # Pick the top frame per ~window, capped at MAX_FRAMES
+    # Pick the top frame per ~window, capped at MAX_FRAMES.
+    # Dedup rule: reject any candidate within `window_s` of an ALREADY-picked
+    # frame. We iterate by score so picks land at quality-maxima, but every
+    # pick must be at least window_s away from every prior pick.
+    #
+    # (The previous version anded a `last_t` proximity check with the full
+    #  scan — but `last_t` only tracked the most-recently-picked timestamp,
+    #  so picking a far-away frame unlocked all the close-to-old-picks ones.
+    #  Manifested as 0.04s-apart clusters in arthroscopy clips.)
     window_s = max(2.0, duration_s / MAX_FRAMES) if duration_s > 0 else 2.0
     selected = []
-    last_t = -1e9
     for c in sorted(candidates, key=lambda x: -x["score"]):
-        if abs(c["timestamp_s"] - last_t) < (window_s * 0.8) and any(
-            abs(c["timestamp_s"] - s["timestamp_s"]) < (window_s * 0.5) for s in selected
-        ):
+        if any(abs(c["timestamp_s"] - s["timestamp_s"]) < window_s for s in selected):
             continue
         selected.append(c)
-        last_t = c["timestamp_s"]
         if len(selected) >= MAX_FRAMES:
             break
     selected.sort(key=lambda x: x["timestamp_s"])
-    print(f"[ingest] selected {len(selected)} smart frames")
+    print(f"[ingest] selected {len(selected)} smart frames "
+          f"(window={window_s:.2f}s; from {len(candidates)} candidates)")
 
     # Write JPGs + register each frame in Lakebase
     # (note: cannot use `# COMMAND ----------` mid-try — Databricks treats

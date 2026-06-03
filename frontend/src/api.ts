@@ -345,12 +345,41 @@ export const api = {
       body: JSON.stringify(cfg),
     }).then(asJson<TaskConfig>),
 
-  storeHFToken: (token: string) =>
+  getLocalModelPresets: () =>
+    fetch("/api/setup/local-model-presets").then(asJson<{
+      presets: { name: string; hf_repo: string; label: string }[];
+    }>),
+
+  listRuns: () =>
+    fetch("/api/runs/active").then(asJson<{
+      runs: {
+        run_id: number;
+        name: string;
+        kind: "ingest" | "cache" | "optimize" | "train" | "repin" | "local-inference" | "other";
+        life_cycle_state: string;
+        result_state: string;
+        state_message: string | null;
+        start_time: number;
+        end_time: number;
+        run_url: string | null;
+      }[];
+      fetched_at: number;
+    }>),
+
+  storeHFToken: (token: string, models?: { name: string; hf_repo: string; revision?: string }[]) =>
     fetch("/api/setup/hf-token", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
-    }).then(asJson<{ ok: boolean; scope: string; key: string; len: number }>),
+      body: JSON.stringify({ token, models }),
+    }).then(asJson<{
+      ok: boolean;
+      scope: string;
+      key: string;
+      len: number;
+      models_run_id?: number;
+      models_run_url?: string;
+      models_error?: string;
+    }>),
 
   uploadToLibrary: (kind: "video" | "image_batch", file: File, batchName?: string) => {
     const fd = new FormData();

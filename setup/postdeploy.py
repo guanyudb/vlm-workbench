@@ -70,8 +70,13 @@ def _sql(stmt: str):
 
 _sql(f"GRANT USE CATALOG ON CATALOG {UC_CATALOG} TO `{sp_app_id}`")
 _sql(f"GRANT USE SCHEMA, CREATE TABLE, CREATE FUNCTION, CREATE MODEL, "
-     f"CREATE VOLUME, MODIFY, SELECT, EXECUTE "
+     f"CREATE VOLUME, MODIFY, SELECT, EXECUTE, MANAGE "
      f"ON SCHEMA {UC_CATALOG}.{UC_SCHEMA} TO `{sp_app_id}`")
+# MANAGE is needed for UC-managed MLflow prompt updates (registering a new
+# version of an existing prompt). The CREATE_MODEL/CREATE_FUNCTION privileges
+# only cover initial creation; updates go through the schema-level prompt
+# admin permission gate which falls under MANAGE. Without it, register_prompt
+# fails with `PERMISSION_DENIED: Permission denied to update prompt`.
 _sql(f"GRANT READ VOLUME, WRITE VOLUME ON VOLUME "
      f"{UC_CATALOG}.{UC_SCHEMA}.{VOLUME} TO `{sp_app_id}`")
 
@@ -79,13 +84,30 @@ _sql(f"GRANT READ VOLUME, WRITE VOLUME ON VOLUME "
 # Secret scope ACLs — only attempt if the scope already exists. The
 # workbench_secret_scope is created by the bundle; the HF scope must exist
 # beforehand because we can't create it without the user's HF token.
-def _grant_secret(scope: str, perm: str):
-    if not scope: return "(skipped — no scope)"
+def _ensure_scope(scope: str) -> bool:
+    """Create the scope if missing. Idempotent; returns True if usable."""
+    if not scope:
+        return False
     try:
         existing = [s.name for s in w.secrets.list_scopes()]
-        if scope not in existing:
-            return f"scope {scope!r} not found, skipping"
-        # put-acl is idempotent
+    except Exception as e:
+        print(f"  could not list scopes: {e}")
+        return False
+    if scope in existing:
+        return True
+    try:
+        w.secrets.create_scope(scope=scope)
+        print(f"  created scope {scope!r}")
+        return True
+    except Exception as e:
+        print(f"  failed to create scope {scope!r}: {e}")
+        return False
+
+def _grant_secret(scope: str, perm: str):
+    if not scope: return "(skipped — no scope)"
+    if not _ensure_scope(scope):
+        return f"scope {scope!r} unavailable"
+    try:
         w.secrets.put_acl(scope=scope, principal=sp_app_id, permission=perm)
         return f"granted {perm} on {scope!r}"
     except Exception as e:

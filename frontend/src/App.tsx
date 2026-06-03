@@ -3,7 +3,10 @@ import { Beaker, BookOpen, BarChart3, Settings, Wrench, Briefcase, MessageSquare
 import { ThemeProvider } from "@/components/apx/theme-provider";
 import { Navbar } from "@/components/apx/navbar";
 import { OptimizeStatusIndicator } from "@/components/apx/optimize-status-indicator";
+import { RunsIndicator } from "@/components/apx/runs-indicator";
+import { SetupGateBanner } from "@/components/apx/setup-gate-banner";
 import { OptimizeTrackerProvider } from "@/lib/optimize-tracker";
+import { RunsTrackerProvider } from "@/lib/runs-tracker";
 import { api } from "@/api";
 import Playground from "@/Playground";
 import Studio from "@/Studio";
@@ -18,6 +21,11 @@ import { cn } from "@/lib/utils";
 const PHASE2 = ["library", "compare", "label", "train", "deploy", "videos", "setup", "eval", "jobs", "agent", "settings"] as const;
 type Route = "playground" | "studio" | (typeof PHASE2)[number];
 
+// "Jobs" used to live here as a coming-soon item — the navbar runs pill
+// already surfaces in-flight + recent job runs across all tabs, so a
+// dedicated tab would be redundant. Eval, the second "Library" (docs/
+// playbooks), and Agent stay as soon-markers because they're distinct
+// future features, not duplicates of something already shipped.
 const ROUTES: { id: Route; label: string; icon: any; available: boolean }[] = [
   { id: "videos", label: "Library", icon: Video, available: true },
   { id: "playground", label: "Playground", icon: Beaker, available: true },
@@ -29,16 +37,17 @@ const ROUTES: { id: Route; label: string; icon: any; available: boolean }[] = [
   { id: "setup", label: "Setup", icon: Settings, available: true },
   { id: "library", label: "Library", icon: BookOpen, available: false },
   { id: "eval", label: "Eval", icon: Wrench, available: false },
-  { id: "jobs", label: "Jobs", icon: Briefcase, available: false },
   { id: "agent", label: "Agent", icon: MessageSquare, available: false },
 ];
 
 export default function App() {
   return (
     <ThemeProvider defaultTheme="light">
-      <OptimizeTrackerProvider>
-        <Main />
-      </OptimizeTrackerProvider>
+      <RunsTrackerProvider>
+        <OptimizeTrackerProvider>
+          <Main />
+        </OptimizeTrackerProvider>
+      </RunsTrackerProvider>
     </ThemeProvider>
   );
 }
@@ -101,8 +110,15 @@ function Main() {
             />
           </span>
         }
-        right={<OptimizeStatusIndicator onApplyPrompt={applyOptimizedPrompt} />}
+        right={
+          <div className="flex items-center gap-2">
+            <RunsIndicator />
+            <OptimizeStatusIndicator onApplyPrompt={applyOptimizedPrompt} />
+          </div>
+        }
       />
+
+      <SetupGateBanner currentRoute={route} goToSetup={() => navigate("setup")} />
 
       <div className="flex">
         <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-48 shrink-0 border-r bg-card/40 lg:block">
