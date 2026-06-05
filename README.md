@@ -1,7 +1,8 @@
 # Surgical VLM Workbench
 
-A Databricks App that takes a surgical video (or a folder of frames) from raw bytes
-to a fine-tuned, deployed VLM, with a unified UI for every step in between.
+A Databricks App that takes a surgical video (or a folder of frames) from raw
+bytes to a fine-tuned, deployed VLM, with a unified UI for every step in
+between.
 
 The opinionated workflow:
 
@@ -12,31 +13,30 @@ Library  →  Playground  →  Label  →  Optimize  →  Train  →  Deploy  �
               + prompt    in 28 keys                                       w/ scoring
 ```
 
-Each step is its own tab. Each artifact (snapshot, label set, optimized prompt,
-fine-tuned model, evaluation run) is tracked in Lakebase + MLflow + Unity
-Catalog so the whole loop is reproducible and shareable.
+Each step is its own tab. Each artifact (snapshot, label set, optimized
+prompt, fine-tuned model, evaluation run) is tracked in Lakebase + MLflow +
+Unity Catalog so the whole loop is reproducible and shareable.
 
 ## Stack
 
-- **Backend**: FastAPI (`app.py`, ~7K LOC). Files API → Volume, OpenAI-compat
-  → AI Gateway, Databricks Jobs API → serverless GPU, MLflow → UC.
-- **Frontend**: React 18 + Vite + TypeScript + Tailwind v4 + shadcn/ui
-  (apx-style design system).
-- **State**: Lakebase (Postgres) for snapshots / labels / videos /
-  extracted-frames index / studio analyses / audio transcripts. Delta tables
+- **Backend** — FastAPI (`app.py`). Files API → Volume, OpenAI-compat → AI
+  Gateway, Databricks Jobs API → serverless GPU, MLflow → UC.
+- **Frontend** — React 18 + Vite + TypeScript + Tailwind v4 + shadcn/ui.
+- **State** — Lakebase (Postgres) for snapshots / labels / videos /
+  extracted-frames index / Studio analyses / audio transcripts. Delta tables
   for long-term backups. UC Volumes for binaries (videos, frames, model
   checkpoints).
-- **Compute**: serverless GPU (`GPU_1xA10`, `GPU_8xH100`) with
-  `databricks_ai_v4` base env for VLM inference + LoRA fine-tuning,
-  AI Gateway for FMAPI VLMs.
-- **Tracking**: MLflow GenAI primitives (`register_prompt`, `datasets`,
+- **Compute** — serverless GPU (`GPU_1xA10`, `GPU_8xH100`) with
+  `databricks_ai_v4` base env for VLM inference + LoRA fine-tuning, AI
+  Gateway for FMAPI VLMs.
+- **Tracking** — MLflow GenAI primitives (`register_prompt`, `datasets`,
   `evaluate`) end-to-end.
 
 ## Tabs
 
 | Tab | What it does |
-|---|---|
-| **Library** | Drop MP4s into `/Volumes/.../videos/inbox/` or JPGs into `/Volumes/.../images/<batch>/`. One click → smart-frame extraction job, frames registered in Lakebase, Playground sees them. |
+| --- | --- |
+| **Library** | Upload (drag-and-drop) or drop MP4s into `videos/inbox/` and JPGs into `images/<batch>/`. One click → smart-frame extraction job, frames registered in Lakebase, Playground sees them. |
 | **Playground** | Pick frames + N VLMs (AI Gateway and/or local serverless GPU) + a prompt → side-by-side results with ✓/✗ vs gold and per-model accuracy. Save as a snapshot. |
 | **Label** | Bootstrap labels from a snapshot's best model → verify each frame with hotkeys → save as ground truth → optionally Sync to Delta + UC GenAI dataset. |
 | **Optimize** (dialog in Playground) | GEPA or DSPy prompt optimization against gold labels (or a teacher model). Optimized prompt is registered as a new MLflow `PromptVersion`. |
@@ -44,75 +44,106 @@ Catalog so the whole loop is reproducible and shareable.
 | **Deploy** | Spin up a Databricks Model Serving endpoint for any UC-registered model (base or fine-tuned). Endpoints appear in Playground's AI Gateway list for direct A/B comparison. |
 | **Compare** | Side-by-side scoreboard for 2+ snapshots — shared frames, agreement %, per-cell predictions. |
 | **Studio** | Watch a whole video with the per-frame VLM analysis aligned to the timeline + optional MLflow vs-gold scorecard. |
+| **Setup** | Health checks for every dependency (UC, Volume, Lakebase, SQL warehouse, HF token, MLflow experiment, GenAI prompts). One-click HF token paste + model cache. Editable task vocabulary + response schema + prompt template. |
 
-## Setup
+## Deployment
 
-### Requirements
+The workbench deploys via **Databricks Asset Bundles** (DAB). One command
+creates everything: the App, UC schema/volume, secret scopes, jobs, and the
+post-deploy job that grants permissions and seeds workspace metadata.
 
-- Databricks workspace with serverless GPU enabled and Model Serving access
-- Unity Catalog with a writable catalog/schema (defaults: `hls_amer_catalog.guanyu_chen`)
-- A Lakebase Postgres instance (defaults: `lakebasepoc`)
-- A SQL warehouse the app's SP can `CAN_USE`
-- Hugging Face token for gated repos (stored in a Databricks secret scope)
+### Prerequisites
 
-### Configure `app.yaml`
+- A Databricks workspace with serverless GPU enabled and Model Serving access
+- Unity Catalog with a writable catalog where you have `CREATE SCHEMA`
+- A Lakebase Postgres **Project** (new Autoscaling model) — create one in
+  the workspace UI under Compute → Lakebase. Note the project name + the
+  database name (default `databricks_postgres`).
+- A SQL warehouse the App SP can `CAN_USE`
+- A Hugging Face token (for gated repos like MedGemma). The App's Setup tab
+  can also accept the token directly — you don't need to put it in a
+  workspace secret beforehand.
+- `databricks` CLI authenticated to the target workspace
+  (`databricks auth login`)
 
-```yaml
-resources:
-  - name: sql-warehouse
-    sql_warehouse:
-      id: "<warehouse-id>"
-      permission: CAN_USE
-  - name: lakebase
-    database:
-      database_name: vlm_workbench
-      instance_name: <lakebase-instance-name>
-      permission: CAN_CONNECT_AND_CREATE
-env:
-  - name: DATABRICKS_HOST
-    value: "https://<workspace>.cloud.databricks.com/"
-  - name: MLFLOW_ENABLE_DB_SDK
-    value: "1"
-  - name: MLFLOW_TRACKING_URI
-    value: "databricks"
-  - name: MLFLOW_REGISTRY_URI
-    value: "databricks-uc"
-  - name: VOLUME_PATH
-    value: "/Volumes/<catalog>/<schema>/<volume>"
-```
+### Configure your workspace values
 
-### App SP permissions
-
-The app's service principal needs:
-- `CAN_USE` on the SQL warehouse
-- `USE CATALOG`, `USE SCHEMA`, `MODIFY`, `SELECT`, `EXECUTE`, `CREATE TABLE`,
-  `CREATE FUNCTION`, `CREATE MODEL`, `CREATE VOLUME` on the target catalog/schema
-- `READ VOLUME`, `WRITE VOLUME` on the data Volume
-- `READ` on the HF token secret scope
-  (`databricks secrets put-acl <scope> <SP_ID> READ`)
-- A Postgres role in the Lakebase instance keyed by the SP UUID
-
-**Known limitation**: UC-managed MLflow Prompts have a permission check that
-isn't grantable via SQL. If the app reports "Permission denied to update
-prompt in schema", add the SP as a schema co-owner via the UC UI. The Delta
-+ Lakebase paths are unaffected and the Optimize / Train / Studio MLflow run
-logging still works.
-
-### Build + deploy
+Copy the sample and fill in your workspace's values:
 
 ```bash
-./build.sh                                       # npm install + vite build → static/
-WS_BASE=/Workspace/Users/<you>/vlm-workbench
-databricks workspace import-dir . "$WS_BASE" --overwrite --profile <profile>
-databricks apps deploy vlm-workbench --source-code-path "$WS_BASE" --profile <profile>
+cp .databricks/bundle/dev/variable-overrides.json.sample \
+   .databricks/bundle/dev/variable-overrides.json
 ```
 
-### Local dev
+Edit `variable-overrides.json`:
+
+```jsonc
+{
+  "uc_catalog": "<your_catalog>",
+  "uc_schema": "<your_schema>",
+  "sql_warehouse_id": "<your_warehouse_id>",
+  "lakebase_instance": "<your_lakebase_project_name>",
+  "lakebase_branch": "production",
+  "lakebase_database": "databricks_postgres",
+  "lakebase_database_path": "databricks-postgres",
+  "hf_secret_scope": "vlmwb_hf",
+  "hf_secret_key": "HF_TOKEN"
+}
+```
+
+Notes:
+- `lakebase_database_path` is the DAB resource slug for the Postgres
+  database (typically the database name with `_` → `-`). For the default
+  `databricks_postgres` database this is `databricks-postgres`.
+- `hf_secret_scope` is a per-deploy scope (default `vlmwb_hf`). The post-
+  deploy step creates it if it doesn't exist; you paste your HF token from
+  the Setup tab afterward.
+
+### Deploy
+
+```bash
+./deploy.sh dev --profile <your-profile>
+```
+
+This wraps the canonical sequence and runs it as one command:
+
+1. `./build.sh` — builds the React SPA into `static/`.
+2. Pre-seed workbench secrets (idempotent).
+3. `databricks bundle deploy -t dev` — creates the App, UC schema, volume,
+   secret scope, jobs, and binds them all together.
+4. `databricks bundle run -t dev vlmwb_postdeploy_setup` — grants the App
+   SP the UC + Postgres + secret-scope permissions it needs.
+5. `databricks bundle run -t dev vlm_workbench_app` — pushes the source to
+   the App and starts it.
+
+The CLI prints the App URL at the end. Open it in your browser.
+
+### First-time setup in the App
+
+1. Open the **Setup** tab. Every check should be green except possibly the
+   HuggingFace token (placeholder seeded on first deploy) and the Local
+   model cache (empty until you cache models).
+2. On the HuggingFace row, click **Set token / cache** → paste your HF
+   token → keep both model checkboxes ticked → **Save + cache 2**. The
+   workbench submits a Databricks job that snapshots Qwen3-VL-8B and
+   MedGemma-4b-it to your Volume (~5–30 min depending on network).
+3. Open the **Library** tab → drop an MP4 (or use the drag-and-drop zone)
+   → click **Ingest**. The smart-frame extractor runs and frames appear in
+   Playground.
+
+### Multiple workspaces
+
+To deploy to a different workspace (e.g., for a customer demo), create a
+new target in `databricks.yml` and a matching `variable-overrides.json`
+under `.databricks/bundle/<target>/`. Targets are workspace-agnostic; all
+workspace-specific values live in the overrides file.
+
+## Local development
 
 ```bash
 # Terminal 1 — backend (uses your CLI auth profile)
 DATABRICKS_CONFIG_PROFILE=<profile> \
-VOLUME_PATH=/Volumes/<catalog>/<schema>/<volume> \
+UC_CATALOG=<catalog> UC_SCHEMA=<schema> VOLUME_NAME=<volume> \
 DATABRICKS_WAREHOUSE_ID=<warehouse-id> \
 uvicorn app:app --port 8000 --reload
 
@@ -126,10 +157,24 @@ Open http://localhost:5173.
 
 ```
 vlm-workbench/
+├── README.md
+├── databricks.yml                  # DAB bundle root
+├── variables.yml                   # Per-workspace knobs (defaults + descriptions)
+├── deploy.sh                       # One-command wrapper (build → deploy → postdeploy → app)
+├── build.sh                        # npm install + vite build → static/
 ├── app.py                          # FastAPI backend
-├── app.yaml                        # Databricks App config
+├── app.yaml                        # Databricks Apps runtime config (env, command)
 ├── requirements.txt
-├── build.sh                        # npm install + vite build
+├── resources/                      # DAB resource definitions
+│   ├── app.yml                     # The Databricks App + its resource bindings
+│   ├── schema.yml                  # UC schema
+│   ├── volumes.yml                 # UC volume
+│   ├── secrets.yml                 # Workbench secret scope
+│   └── jobs/
+│       └── postdeploy_setup.yml    # Post-deploy GRANT + bootstrap job
+├── setup/
+│   ├── postdeploy.py               # Notebook the postdeploy job runs
+│   └── lakebase_probe.py           # Debug notebook (probes Lakebase from user identity)
 ├── frontend/                       # React SPA
 │   └── src/
 │       ├── App.tsx                 # nav + routing
@@ -140,51 +185,50 @@ vlm-workbench/
 │       ├── Studio.tsx              # video + per-frame timeline
 │       ├── Compare.tsx             # multi-snapshot scoreboard
 │       ├── Videos.tsx              # Library tab
-│       └── components/             # shadcn primitives + apx shell
-├── local_inference_notebooks/      # bundled, parameterized notebooks
-│   ├── run/                        # local VLM batch inference (Playground)
+│       ├── Setup.tsx               # Health checks + task config + HF dialog
+│       └── components/             # shadcn primitives + apx shell + runs pill
+├── local_inference_notebooks/      # Bundled, parameterized notebooks
+│   ├── run/                        # Local VLM batch inference (Playground)
 │   ├── finetune/                   # LoRA fine-tune (Train)
-│   ├── repin/                      # re-register UC model with corrected reqs
-│   └── setup_cache/                # snapshot HF weights to Volume
-├── optimizer_notebooks/            # bundled prompt-optimizer notebooks
+│   ├── repin/                      # Re-register UC model with corrected reqs
+│   └── setup_cache/                # Snapshot HF weights to Volume
+├── optimizer_notebooks/            # Bundled prompt-optimizer notebooks
 │   ├── gepa/
 │   └── dspy/
-├── ingest_notebooks/               # bundled smart-frame extractor (Library)
+├── ingest_notebooks/               # Bundled smart-frame extractor (Library)
 │   └── smart_frames/
-└── experiments/                    # standalone verification jobs
-    ├── surgical_vlm_eval/
-    └── mlflow_genai_verify/
+└── experiments/                    # Standalone verification jobs
 ```
 
-## Workflow walkthrough
+## End-to-end workflow
 
 Concrete example: arthroscopy procedure → instrument-ID model.
 
-1. **Library** — drop `vid.mp4` into `/Volumes/.../videos/inbox/`. Click
-   `Ingest`. Smart-frame extractor runs (~1 min for a 4-min video), 30
-   best frames register in Lakebase.
-2. **Playground** — pick all 30 frames. Select Sonnet 4.5, GPT-5-2, Qwen3-VL
+1. **Library** — drop `vid.mp4` into the upload zone (or copy it into
+   `/Volumes/.../videos/inbox/`). Click **Ingest**. Smart-frame extractor
+   runs (~1 min for a 4-min video), the best frames register in Lakebase.
+2. **Playground** — pick all frames. Select Sonnet 4.5, GPT-5, Qwen3-VL
    (local), MedGemma (local). Run. See ✓/✗ per cell (vs any pre-existing
    labels) + per-model accuracy.
 3. Save snapshot. Send to **Label**.
-4. **Label** — Bootstrap from snapshot (uses best_model's predictions to
-   pre-fill). Verify each frame with `1`–`9` hotkeys + `Enter` to save.
+4. **Label** — Bootstrap from snapshot (uses the best model's predictions
+   to pre-fill). Verify each frame with `1`–`9` hotkeys + `Enter` to save.
 5. **Sync to Delta** + UC GenAI dataset.
-6. Back to **Playground** → Optimize Prompt. Teacher = `Gold labels`,
+6. Back to **Playground** → **Optimize prompt**. Teacher = `Gold labels`,
    student = Qwen3-VL. Run GEPA for 5 rounds. Apply the resulting prompt.
-   The MLflow run has the trajectory, the optimized prompt is registered
+   The MLflow run has the trajectory; the optimized prompt is registered
    as a new version.
-7. **Train** — base = `qwen3-vl-8b`, label scope = all 28 labels.
-   Start fine-tune. ~10 min on 1×A10. New UC model auto-appears in
-   Playground's Local section.
-8. **Playground** — A/B base Qwen vs the fine-tune on the same 28 frames.
+7. **Train** — base = `qwen3-vl-8b`, label scope = all 28 labels. Start
+   fine-tune. ~10 min on 1×A10. New UC model auto-appears in Playground's
+   Local section.
+8. **Playground** — A/B base Qwen vs the fine-tune on the same frames.
    Accuracy chips show the lift.
-9. **Deploy** — pick the fine-tuned model → workload `GPU_LARGE` → Deploy.
+9. **Deploy** — pick the fine-tuned model → workload size → **Deploy**.
    ~10 min cold-start. Endpoint appears in Playground's AI Gateway list.
 10. **Studio** — analyze the full video with the deployed endpoint.
     MLflow vs-gold scorecard logs everything to the workbench experiment.
 
 ## License
 
-Internal. Code is shared as a reference Databricks App for VLM
-experimentation workflows; not a supported product.
+Code is shared as a reference Databricks App for VLM experimentation
+workflows; not a supported product.
