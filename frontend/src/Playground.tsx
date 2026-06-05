@@ -134,6 +134,12 @@ export default function Playground({
   // when /api/task-config is reachable. Used by the "Reset" button so it
   // restores the workspace's current task config, not an old code constant.
   const [workspaceDefaultPrompt, setWorkspaceDefaultPrompt] = useState<string>(DEFAULT_PROMPT);
+  // Prompt registration (MLflow PromptVersion in UC). Optimize already
+  // auto-registers when it produces a winner; this button covers the
+  // manual case — user iterated the prompt by hand and wants to snapshot
+  // the current version.
+  const [registering, setRegistering] = useState(false);
+  const [registerStatus, setRegisterStatus] = useState<string | null>(null);
   useEffect(() => {
     api.getTaskConfig()
       .then((c) => { if (c.rendered_prompt) setWorkspaceDefaultPrompt(c.rendered_prompt); })
@@ -1016,6 +1022,40 @@ export default function Playground({
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-base">Prompt</CardTitle>
             <div className="flex items-center gap-2">
+              {registerStatus && (
+                <span className={cn(
+                  "text-xs",
+                  registerStatus.startsWith("err") ? "text-destructive" : "text-emerald-600",
+                )}>{registerStatus}</span>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!prompt.trim() || registering}
+                onClick={async () => {
+                  setRegistering(true);
+                  setRegisterStatus(null);
+                  try {
+                    const r = await api.registerPrompt(
+                      prompt,
+                      "registered from Playground",
+                      { source: "playground" },
+                    );
+                    setRegisterStatus(
+                      r.version ? `registered v${r.version}` : `registered`
+                    );
+                    setTimeout(() => setRegisterStatus(null), 6000);
+                  } catch (e) {
+                    setRegisterStatus(`err: ${(e as Error).message.slice(0, 80)}`);
+                  } finally {
+                    setRegistering(false);
+                  }
+                }}
+                title="Register the current prompt as a new MLflow prompt version in UC"
+              >
+                {registering ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />}
+                Register prompt
+              </Button>
               <Button variant="ghost" size="sm" onClick={() => setPrompt(workspaceDefaultPrompt)}>
                 Reset to default
               </Button>

@@ -337,6 +337,13 @@ export const api = {
 
   getTaskConfig: () => fetch("/api/task-config").then(asJson<TaskConfig>),
 
+  registerPrompt: (template: string, commit_message?: string, tags?: Record<string, string>) =>
+    fetch("/api/mlflow/prompts/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template, commit_message: commit_message || "", tags }),
+    }).then(asJson<{ name: string; version: number | null; uri: string | null }>),
+
   saveTaskConfig: (cfg: Pick<TaskConfig, "vocabulary" | "prompt_template"> &
                         { response_schema?: TaskResponseSchema }) =>
     fetch("/api/task-config", {

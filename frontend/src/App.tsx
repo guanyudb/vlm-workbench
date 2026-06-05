@@ -35,7 +35,10 @@ const ROUTES: { id: Route; label: string; icon: any; available: boolean }[] = [
   { id: "studio", label: "Studio", icon: Film, available: true },
   { id: "compare", label: "Compare", icon: BarChart3, available: true },
   { id: "setup", label: "Setup", icon: Settings, available: true },
-  { id: "library", label: "Library", icon: BookOpen, available: false },
+  // The Videos tab (top of the list) IS our Library — the second "library"
+  // greyed-out entry was originally a placeholder for a docs/playbooks
+  // page. Removed to stop confusing users into thinking Library was
+  // unavailable.
   { id: "eval", label: "Eval", icon: Wrench, available: false },
   { id: "agent", label: "Agent", icon: MessageSquare, available: false },
 ];
