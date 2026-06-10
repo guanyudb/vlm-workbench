@@ -1389,7 +1389,12 @@ class PlaygroundRequest(BaseModel):
     frame_paths: List[str] = Field(..., description="Volume paths to frame JPEGs")
     model_names: List[str] = Field(..., description="FMAPI endpoint names to query")
     prompt: str = DEFAULT_PROMPT
-    max_tokens: int = 600
+    # Default budget bumped to accommodate reasoning models (e.g.
+    # `databricks-claude-fable-5`), which spend most of their tokens on
+    # an internal (private) thinking trace before emitting the answer.
+    # At 600 tokens, fable consumed all of them on reasoning and returned
+    # no text block — empirically 2000 leaves enough room for the answer.
+    max_tokens: int = 2000
     temperature: float = 0.0
 
 
@@ -1451,6 +1456,39 @@ def _call_responses_api(client, model_name: str, frame_b64: str, prompt: str,
     return "".join(chunks)
 
 
+def _extract_text(content) -> str:
+    """Normalize chat-completion `message.content` to a plain string.
+
+    Most endpoints return a string. Reasoning-flavored Claude variants
+    (e.g. `databricks-claude-fable-5`) return a LIST of typed content
+    blocks instead:
+
+        [
+          {"type": "reasoning", "summary": [...]},
+          {"type": "text", "text": "{\\"instrument\\": ...}"}
+        ]
+
+    Returning the list as-is breaks every downstream consumer that does
+    `text.strip()` or `text.find("{")` — manifests as
+    `'list' object has no attribute 'strip'` in the Playground cell.
+    Concatenate every `type: text` block's text and drop the reasoning
+    blocks (the summary is intentionally empty in the response anyway —
+    Anthropic keeps the actual chain-of-thought private)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts)
+    return str(content)
+
+
 def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
              max_tokens: int, temperature: float) -> dict:
     """Run one (model × frame) call. Some endpoints have quirks we work around:
@@ -1479,11 +1517,11 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
         # when a model chooses prose. Every prompt template the workbench
         # ships already requests strict JSON, so this just enforces what was
         # asked. Endpoints that don't accept `response_format` get retried
-        # below without it.
+        # below without it (fable-5 returns INVALID_PARAMETER_VALUE, for one).
         if send_response_format:
             kwargs["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content or ""
+        return _extract_text(resp.choices[0].message.content)
 
     try:
         try:
@@ -1500,17 +1538,6 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
             # Retry via Responses API for endpoints that require it.
             elif "responses api" in msg.lower() or "/serving-endpoints/responses" in msg.lower():
                 text = _call_responses_api(client, model_name, frame_b64, prompt, max_tokens)
-            # Text-only endpoints (e.g. `databricks-claude-fable-5`) crash
-            # on multimodal content with `'list' object has no attribute
-            # 'strip'`. Surface a friendlier error so the user picks a
-            # vision-capable model instead of staring at a Python type
-            # error.
-            elif "'list' object has no attribute 'strip'" in msg:
-                raise RuntimeError(
-                    f"`{model_name}` doesn't accept image input — try a "
-                    f"vision-capable model (claude-opus / claude-sonnet / "
-                    f"gpt-5 / gemini / llama-4-maverick)."
-                )
             else:
                 raise
         return {
