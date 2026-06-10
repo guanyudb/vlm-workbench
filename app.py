@@ -541,6 +541,12 @@ class HFModelSpec(BaseModel):
     name: str            # slug used for the directory + manifest
     hf_repo: str         # Hugging Face repo id (e.g. "Qwen/Qwen3-VL-8B-Instruct")
     revision: Optional[str] = "main"
+    # Optional manifest extras that flow through setup_cache → manifest.yaml
+    # → the local-run submitter. Used to pin bigger/different models to the
+    # right GPU + inference notebook without forking the whole flow.
+    accelerator: Optional[str] = None        # e.g. "GPU_1xH100"
+    base_environment: Optional[str] = None   # e.g. "databricks_ai_v4"
+    inference_notebook: Optional[str] = None  # e.g. "run_gemma4"
 
 
 class HFTokenIn(BaseModel):
@@ -554,6 +560,12 @@ class HFTokenIn(BaseModel):
 LOCAL_MODEL_PRESETS: List[Dict[str, str]] = [
     {"name": "qwen3-vl-8b",   "hf_repo": "Qwen/Qwen3-VL-8B-Instruct", "label": "Qwen3-VL-8B (Apache-2.0)"},
     {"name": "medgemma-4b-it","hf_repo": "google/medgemma-4b-it",     "label": "MedGemma-4B-it (gated)"},
+    # Gemma 4 needs transformers >= 5.5.0 and won't fit on A10 at 12B.
+    # The preset metadata flows through setup_cache → manifest.yaml → the
+    # local-run submitter, which then picks the right notebook + GPU.
+    {"name": "gemma-4-12b-it", "hf_repo": "google/gemma-4-12B-it",
+     "label": "Gemma 4 12B-it (Apache-2.0)",
+     "accelerator": "GPU_1xH100", "inference_notebook": "run_gemma4"},
 ]
 
 
@@ -980,6 +992,7 @@ def setup_check():
         ("optimizer/gepa", lambda: _resolve_optimizer_notebook("gepa")),
         ("optimizer/dspy", lambda: _resolve_optimizer_notebook("dspy")),
         ("local_inference/run", _resolve_local_inference_notebook),
+        ("local_inference/run_gemma4", lambda: _resolve_local_inference_notebook_variant("run_gemma4")),
         ("local_inference/finetune", _resolve_finetune_notebook),
         ("ingest/smart_frames", _resolve_ingest_notebook),
     ]
@@ -1631,6 +1644,49 @@ def _resolve_local_inference_notebook() -> str:
     return target_path
 
 
+def _resolve_local_inference_notebook_variant(variant: str) -> str:
+    """Family-specific inference notebooks (e.g. ``run_gemma4`` for Gemma 4
+    which needs transformers >= 5.5.0). Same import-to-SP-home pattern as
+    ``_resolve_local_inference_notebook``; the variant name is the subdir
+    under ``local_inference_notebooks/``. Manifest's
+    ``inference_notebook`` field picks which one. Falls back to the
+    default ``run`` notebook when the variant subdir is missing."""
+    if not variant or variant == "run":
+        return _resolve_local_inference_notebook()
+    # Reject path-traversal attempts — the manifest is user-editable.
+    if "/" in variant or ".." in variant or variant.startswith("."):
+        raise RuntimeError(f"refusing variant with suspicious chars: {variant!r}")
+    cache_key = f"local_inference_{variant}"
+    if cache_key in _NOTEBOOK_CACHE:
+        return _NOTEBOOK_CACHE[cache_key]
+    base_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "local_inference_notebooks", variant,
+    )
+    candidates = [os.path.join(base_dir, "notebook.py"), os.path.join(base_dir, "notebook")]
+    src_path = next((p for p in candidates if os.path.exists(p)), None)
+    if not src_path:
+        log.warning(f"variant {variant!r} not found at {base_dir} — falling back to default run notebook")
+        return _resolve_local_inference_notebook()
+    with open(src_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode("ascii")
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.workspace import ImportFormat, Language
+    w = WorkspaceClient()
+    target_dir = f"{_sp_home()}/local_inference_notebooks/{variant}"
+    target_path = f"{target_dir}/notebook"
+    w.workspace.mkdirs(target_dir)
+    w.workspace.import_(
+        path=target_path,
+        format=ImportFormat.SOURCE,
+        language=Language.PYTHON,
+        content=content_b64,
+        overwrite=True,
+    )
+    _NOTEBOOK_CACHE[cache_key] = target_path
+    return target_path
+
+
 class LocalModelEntry(BaseModel):
     name: str                # subdir name, also the canonical id
     display_name: str
@@ -1753,7 +1809,12 @@ def submit_local_run(req: LocalRunRequest):
     except Exception as e:
         raise HTTPException(500, f"failed to write YAML config: {e}")
 
-    notebook_path = _resolve_local_inference_notebook()
+    # The manifest decides which inference notebook to use. The default
+    # `run` notebook handles Qwen3-VL + MedGemma + most other multimodal
+    # transformers models. Family-specific variants (`run_gemma4`, …) live
+    # alongside it and override env / package requirements.
+    notebook_variant = manifest.get("inference_notebook") or "run"
+    notebook_path = _resolve_local_inference_notebook_variant(notebook_variant)
     # Correct serverless GPU contract: pair `compute.hardware_accelerator` on
     # the task with a `base_environment: databricks_ai_v4` spec — which is the
     # GPU image that ships with torch + CUDA + ML libs preinstalled. Using

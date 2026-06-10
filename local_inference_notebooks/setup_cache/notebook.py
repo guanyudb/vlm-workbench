@@ -95,6 +95,19 @@ def materialize_overrides(specs: list[dict]) -> list[dict]:
             "revision": spec.get("revision", "main"),
             "provider": spec.get("provider", "huggingface_local"),
         }
+        # Optional manifest fields — only written when the caller specified
+        # them. The app's local-run submitter reads each at runtime to pick
+        # the right accelerator/env/notebook for this specific model.
+        # - accelerator        ("GPU_1xA10" | "GPU_1xH100" | "GPU_8xH100"): needed for
+        #                      bigger models that won't fit on A10
+        # - base_environment   ("databricks_ai_v4" | "5"): controls the
+        #                      preinstalled torch/CUDA/transformers
+        # - inference_notebook ("run" | "run_gemma4"): which inference
+        #                      notebook to dispatch to (some model families
+        #                      need a different env/recipe)
+        for opt in ("accelerator", "base_environment", "inference_notebook"):
+            if spec.get(opt):
+                manifest[opt] = spec[opt]
         with (d / "manifest.yaml").open("w") as f:
             yaml.safe_dump(manifest, f, sort_keys=False)
         manifest["_dir"] = str(d)

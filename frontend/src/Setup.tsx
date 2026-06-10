@@ -252,7 +252,11 @@ function HFTokenDialog({ onSaved, compact }: { onSaved: () => void; compact?: bo
     try {
       const models = presets
         .filter((p) => selected.has(p.name))
-        .map((p) => ({ name: p.name, hf_repo: p.hf_repo }));
+        // Spread the preset so optional fields (accelerator,
+        // base_environment, inference_notebook) flow through to the backend
+        // and get baked into the manifest.yaml that setup_cache writes.
+        // Without this, Gemma 4 12B would default to GPU_1xA10 and OOM.
+        .map((p) => ({ ...p }));
       const r = await api.storeHFToken(token.trim(), models.length ? models : undefined);
       const partials: string[] = [`token stored in ${r.scope}/${r.key} (${r.len} chars)`];
       if (r.models_run_id) {

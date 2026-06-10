@@ -354,7 +354,17 @@ export const api = {
 
   getLocalModelPresets: () =>
     fetch("/api/setup/local-model-presets").then(asJson<{
-      presets: { name: string; hf_repo: string; label: string }[];
+      presets: {
+        name: string;
+        hf_repo: string;
+        label: string;
+        // Optional manifest hints. Default for omitted fields = GPU_1xA10 +
+        // the standard `run` notebook. Bigger or family-specific models
+        // override these (e.g., Gemma 4 needs run_gemma4 + GPU_1xH100).
+        accelerator?: string;
+        base_environment?: string;
+        inference_notebook?: string;
+      }[];
     }>),
 
   listRuns: () =>
