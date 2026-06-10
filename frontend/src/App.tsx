@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Beaker, BookOpen, BarChart3, Settings, Wrench, Briefcase, MessageSquare, Film, Tag, Sparkles, Video, Rocket } from "lucide-react";
+import { Beaker, BarChart3, Settings, Wrench, MessageSquare, Film, Tag, Sparkles, Video, Rocket } from "lucide-react";
 import { ThemeProvider } from "@/components/apx/theme-provider";
 import { Navbar } from "@/components/apx/navbar";
 import { OptimizeStatusIndicator } from "@/components/apx/optimize-status-indicator";
@@ -21,26 +21,27 @@ import { cn } from "@/lib/utils";
 const PHASE2 = ["library", "compare", "label", "train", "deploy", "videos", "setup", "eval", "jobs", "agent", "settings"] as const;
 type Route = "playground" | "studio" | (typeof PHASE2)[number];
 
-// "Jobs" used to live here as a coming-soon item — the navbar runs pill
-// already surfaces in-flight + recent job runs across all tabs, so a
-// dedicated tab would be redundant. Eval, the second "Library" (docs/
-// playbooks), and Agent stay as soon-markers because they're distinct
-// future features, not duplicates of something already shipped.
-const ROUTES: { id: Route; label: string; icon: any; available: boolean }[] = [
-  { id: "videos", label: "Library", icon: Video, available: true },
-  { id: "playground", label: "Playground", icon: Beaker, available: true },
-  { id: "label", label: "Label", icon: Tag, available: true },
-  { id: "train", label: "Train", icon: Sparkles, available: true },
-  { id: "deploy", label: "Deploy", icon: Rocket, available: true },
-  { id: "studio", label: "Studio", icon: Film, available: true },
-  { id: "compare", label: "Compare", icon: BarChart3, available: true },
-  { id: "setup", label: "Setup", icon: Settings, available: true },
-  // The Videos tab (top of the list) IS our Library — the second "library"
-  // greyed-out entry was originally a placeholder for a docs/playbooks
-  // page. Removed to stop confusing users into thinking Library was
-  // unavailable.
-  { id: "eval", label: "Eval", icon: Wrench, available: false },
-  { id: "agent", label: "Agent", icon: MessageSquare, available: false },
+// Two-tier route layout: the active tabs make up the primary nav block;
+// the `comingSoon` block lives in a small footer at the bottom of the
+// sidebar so unfinished features don't compete visually with the working
+// ones.
+const ROUTES: { id: Route; label: string; icon: any }[] = [
+  { id: "videos", label: "Library", icon: Video },
+  { id: "playground", label: "Playground", icon: Beaker },
+  { id: "label", label: "Label", icon: Tag },
+  // "Train" → "Refine". Avoids ML jargon while still implying "improve
+  // the model"; flows with the workflow narrative. Route id stays `train`
+  // so saved localStorage routes + bookmarks don't break.
+  { id: "train", label: "Refine", icon: Sparkles },
+  { id: "deploy", label: "Deploy", icon: Rocket },
+  { id: "studio", label: "Studio", icon: Film },
+  { id: "compare", label: "Compare", icon: BarChart3 },
+  { id: "setup", label: "Setup", icon: Settings },
+];
+
+const COMING_SOON: { id: Route; label: string; icon: any }[] = [
+  { id: "eval", label: "Eval", icon: Wrench },
+  { id: "agent", label: "Agent", icon: MessageSquare },
 ];
 
 export default function App() {
@@ -98,10 +99,10 @@ function Main() {
   return (
     <div className="min-h-screen bg-background">
       <Navbar
-        title="Surgical VLM Workbench"
+        title="Surgical Vision Workbench"
         subtitle={
           <span className="flex items-center gap-1.5">
-            Phase 1: Playground + Studio
+            From raw surgical video to a fine-tuned VLM, in one workspace
             <span
               className={cn(
                 "inline-block size-1.5 rounded-full",
@@ -124,26 +125,42 @@ function Main() {
       <SetupGateBanner currentRoute={route} goToSetup={() => navigate("setup")} />
 
       <div className="flex">
-        <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-48 shrink-0 border-r bg-card/40 lg:block">
-          <nav className="flex flex-col gap-0.5 p-2">
-            {ROUTES.map(({ id, label, icon: Icon, available }) => (
+        <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-48 shrink-0 flex-col border-r bg-card/40 lg:flex">
+          <nav className="flex flex-1 flex-col gap-0.5 p-2">
+            {ROUTES.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
-                onClick={() => available && navigate(id)}
-                disabled={!available}
+                onClick={() => navigate(id)}
                 className={cn(
-                  "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors",
+                  "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors hover:bg-accent hover:text-accent-foreground",
                   route === id ? "bg-accent text-accent-foreground" : "text-muted-foreground",
-                  available ? "hover:bg-accent hover:text-accent-foreground" : "opacity-50 cursor-not-allowed"
                 )}
-                title={!available ? "Coming in a later phase" : undefined}
               >
                 <Icon className="size-4" />
                 <span>{label}</span>
-                {!available && <span className="ml-auto text-[10px] text-muted-foreground">soon</span>}
               </button>
             ))}
           </nav>
+          {/* Coming-soon block — placeholder for not-yet-shipped tabs, kept
+              in a separate footer so it doesn't visually compete with the
+              active nav above. */}
+          <div className="border-t p-2">
+            <p className="px-2.5 pb-1 text-[10px] uppercase tracking-wider text-muted-foreground/70">
+              Coming soon
+            </p>
+            <div className="flex flex-col gap-0.5">
+              {COMING_SOON.map(({ id, label, icon: Icon }) => (
+                <div
+                  key={id}
+                  className="flex cursor-not-allowed items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm text-muted-foreground/60"
+                  title="Coming in a later phase"
+                >
+                  <Icon className="size-4" />
+                  <span>{label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
         </aside>
 
         <main className="min-w-0 flex-1 px-4 py-6 sm:px-6">
