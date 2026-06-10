@@ -19,15 +19,19 @@
 # MAGIC for the full debug history that pinned down these constraints.
 
 # COMMAND ----------
-# MAGIC %pip install -q "transformers>=5.5.0" "accelerate>=1.0.0" pyyaml pillow
+# MAGIC %pip install -q "transformers>=5.5.0" "accelerate>=1.0.0" "compressed-tensors>=0.7" pyyaml pillow
 # MAGIC dbutils.library.restartPython()
 # NOTE: torch + torchvision + CUDA come preinstalled in databricks_ai_v4.
 # We deliberately use transformers (not vLLM) here:
 #   - Playground does one-shot per-frame calls, not benchmark throughput
 #   - transformers avoids the mistral_common → opencv → SIGABRT chain we
 #     hit while trying to use nightly vLLM on the Standard env.
-# If/when we add a high-throughput batch path, swap to the vLLM recipe in
-# the memory note (Standard env + nightly vLLM + no opencv + FlashInfer off).
+# `compressed-tensors` is for Google's QAT w4a16 Gemma 4 12B variant
+# (gemma-4-12B-it-qat-w4a16-ct) — transformers auto-detects the
+# quantization config in the model's config.json and routes the
+# weights through compressed-tensors at load time. Pip-installing it
+# unconditionally is harmless when the model is bf16 (the package just
+# isn't touched).
 
 # COMMAND ----------
 import os, json, time, traceback

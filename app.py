@@ -560,12 +560,27 @@ class HFTokenIn(BaseModel):
 LOCAL_MODEL_PRESETS: List[Dict[str, str]] = [
     {"name": "qwen3-vl-8b",   "hf_repo": "Qwen/Qwen3-VL-8B-Instruct", "label": "Qwen3-VL-8B (Apache-2.0)"},
     {"name": "medgemma-4b-it","hf_repo": "google/medgemma-4b-it",     "label": "MedGemma-4B-it (gated)"},
-    # Gemma 4 needs transformers >= 5.5.0 and won't fit on A10 at 12B.
-    # The preset metadata flows through setup_cache → manifest.yaml → the
-    # local-run submitter, which then picks the right notebook + GPU.
+    # Gemma 4 family — needs transformers >= 5.5.0 (the `run_gemma4`
+    # variant pins it). Three sizes available for the workbench:
+    #
+    #   • E4B (MatFormer effective ~4 B, ~16 GB raw weights at bf16):
+    #     fits A10 in bf16. Smallest/fastest.
+    #   • 12B at bf16 (~24 GB weights): won't fit A10's 24 GB total VRAM
+    #     once activations + KV cache are accounted for — pinned to
+    #     1×H100. Best raw quality.
+    #   • 12B int4 (Google's official QAT w4a16 variant, ~6 GB weights):
+    #     fits A10 with headroom. Slight accuracy loss vs bf16, much
+    #     cheaper to serve. Requires `compressed-tensors` in the
+    #     notebook env (added to run_gemma4's pip install).
+    {"name": "gemma-4-e4b-it", "hf_repo": "google/gemma-4-E4B-it",
+     "label": "Gemma 4 E4B-it · ~4B effective, fits A10 (Apache-2.0)",
+     "accelerator": "GPU_1xA10", "inference_notebook": "run_gemma4"},
     {"name": "gemma-4-12b-it", "hf_repo": "google/gemma-4-12B-it",
-     "label": "Gemma 4 12B-it (Apache-2.0)",
+     "label": "Gemma 4 12B-it · bf16, needs H100 (Apache-2.0)",
      "accelerator": "GPU_1xH100", "inference_notebook": "run_gemma4"},
+    {"name": "gemma-4-12b-it-int4", "hf_repo": "google/gemma-4-12B-it-qat-w4a16-ct",
+     "label": "Gemma 4 12B-it int4 · QAT w4a16, fits A10 (Apache-2.0)",
+     "accelerator": "GPU_1xA10", "inference_notebook": "run_gemma4"},
 ]
 
 
