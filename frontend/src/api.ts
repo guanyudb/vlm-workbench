@@ -482,10 +482,16 @@ export const api = {
     base_model_name: string;
     uc_model_name?: string;
     train_prompt?: string;
+    // Data source — labels can come from Lakebase (live) or a UC Delta
+    // table (stable snapshot, e.g. what the Label tab's "Sync to Delta"
+    // button writes).
+    data_source?: "lakebase" | "delta";
+    delta_table?: string;           // optional 3-part UC name; default <cat>.<schema>.frame_labels_delta
+    delta_version?: number;          // optional Delta time-travel version
     // Label filter dimensions — all optional, composed with AND.
     label_filter_instruments?: string[];
     snapshot_id?: string;          // legacy single field; kept for back-compat
-    snapshot_ids?: string[];       // multi-select
+    snapshot_ids?: string[];       // multi-select (Lakebase source only)
     video_names?: string[];
     labeled_since?: string;        // ISO date string
     // Hyperparams
@@ -519,6 +525,9 @@ export const api = {
     snapshot_ids?: string[];
     video_names?: string[];
     labeled_since?: string;
+    data_source?: "lakebase" | "delta";
+    delta_table?: string;
+    delta_version?: number;
   }) =>
     fetch("/api/training/preview", {
       method: "POST",

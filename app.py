@@ -2042,8 +2042,102 @@ DEFAULT_FT_PROMPT = (
 )
 
 
+def _safe_uc_name(s: str) -> str:
+    """Validate a 3-part UC table name. Lets letters, digits, _, and dots
+    through; rejects anything else so we can safely interpolate the name
+    into a SQL statement without enabling injection."""
+    import re as _re
+    if not _re.match(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$", s or ""):
+        raise HTTPException(400, f"invalid UC table name {s!r}; expected catalog.schema.table")
+    return s
+
+
+def _query_delta_labels(
+    delta_table: str,
+    *,
+    delta_version: Optional[int] = None,
+    instruments: Optional[List[str]] = None,
+    video_names: Optional[List[str]] = None,
+    labeled_since: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    """Read labels from a UC Delta table via the configured SQL warehouse.
+    Supports the same composable filters as the Lakebase query (minus
+    snapshot — snapshots only exist in Lakebase).
+
+    Required Delta columns: frame_path, instrument, anatomy,
+    tissue_condition, created_at. The Label tab's `Sync to Delta` button
+    writes a table with exactly that shape; users can also point this at
+    any UC Delta with the same columns.
+
+    Inputs are validated (catalog/schema/table identifier regex, instrument
+    strings quote-escaped) and the warehouse runs as the App SP — so the
+    only access is whatever the SP has on the target table."""
+    table = _safe_uc_name(delta_table)
+    # Build a parameterized statement. The Databricks SQL Statement Execution
+    # API supports named parameters (:name) for values; identifiers must be
+    # interpolated (validated above).
+    where_clauses: List[str] = ["1=1"]
+    named_params: Dict[str, object] = {}
+
+    if instruments:
+        # Build :inst0, :inst1, ... param markers
+        keys = [f"inst{i}" for i in range(len(instruments))]
+        for k, v in zip(keys, instruments):
+            named_params[k] = v
+        where_clauses.append(f"instrument IN ({', '.join(':' + k for k in keys)})")
+    if video_names:
+        # `frame_path` contains the video name as a directory segment
+        ors = []
+        for i, v in enumerate(video_names):
+            k = f"vid{i}"
+            named_params[k] = f"%/{v}/%"
+            ors.append(f"frame_path LIKE :{k}")
+        where_clauses.append("(" + " OR ".join(ors) + ")")
+    if labeled_since:
+        named_params["since"] = labeled_since
+        where_clauses.append("created_at >= TIMESTAMP(:since)")
+
+    version_clause = f" VERSION AS OF {int(delta_version)}" if delta_version is not None else ""
+    sql = (
+        "SELECT frame_path, instrument, anatomy, tissue_condition "
+        f"FROM {table}{version_clause} "
+        f"WHERE {' AND '.join(where_clauses)} "
+        "ORDER BY created_at"
+    )
+
+    warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    if not warehouse_id:
+        raise HTTPException(503, "DATABRICKS_WAREHOUSE_ID not set — Delta data source needs a SQL warehouse")
+    w = _workspace()
+    body: Dict[str, object] = {
+        "warehouse_id": warehouse_id,
+        "statement": sql,
+        "wait_timeout": "30s",
+        "disposition": "INLINE",
+    }
+    if named_params:
+        body["parameters"] = [{"name": k, "value": str(v)} for k, v in named_params.items()]
+    try:
+        resp = w.api_client.do("POST", "/api/2.0/sql/statements", body=body)
+    except Exception as e:
+        raise HTTPException(500, f"Delta query submit failed: {e}")
+    status = (resp.get("status") or {})
+    state = status.get("state")
+    if state != "SUCCEEDED":
+        err = (status.get("error") or {}).get("message") or state
+        raise HTTPException(500, f"Delta query failed ({state}): {err}")
+    data = ((resp.get("result") or {}).get("data_array") or [])
+    return [
+        {"image_path": r[0], "instrument": r[1], "anatomy": r[2], "tissue_condition": r[3]}
+        for r in data
+    ]
+
+
 def _query_finetune_labels(
     *,
+    data_source: str = "lakebase",
+    delta_table: Optional[str] = None,
+    delta_version: Optional[int] = None,
     snapshot_id: Optional[str] = None,
     snapshot_ids: Optional[List[str]] = None,
     instruments: Optional[List[str]] = None,
@@ -2054,17 +2148,35 @@ def _query_finetune_labels(
     Used by both the live preview endpoint and the actual training submit
     so the matching set stays identical across the two.
 
+    `data_source`:
+      - "lakebase" (default): live Postgres `frame_labels` table
+      - "delta":              UC Delta table via SQL warehouse
+
     Filters all compose with AND:
       - instruments      : restrict to these instrument classes
-      - snapshot_id      : legacy single-snapshot field (kept for back-compat)
-      - snapshot_ids     : multi-select snapshots (union of their frame_paths)
+      - snapshot_id      : legacy single-snapshot field (Lakebase only)
+      - snapshot_ids     : multi-select snapshots (Lakebase only; union of their frame_paths)
       - video_names      : labels for frames extracted from these videos
       - labeled_since    : ISO date — labels created at or after this date
 
-    Joins `frame_labels` against `extracted_frames_index` so orphan labels
-    pointing at re-ingested-then-deleted JPGs don't sneak into training and
-    break the notebook with FileNotFoundError mid-epoch.
+    For Lakebase, joins `frame_labels` against `extracted_frames_index` so
+    orphan labels pointing at re-ingested-then-deleted JPGs don't sneak
+    into training and break the notebook with FileNotFoundError mid-epoch.
     """
+    if data_source == "delta":
+        target = delta_table or f"{UC_CATALOG}.{UC_SCHEMA}.frame_labels_delta"
+        # snapshot_ids is intentionally ignored — snapshots live in Lakebase
+        return _query_delta_labels(
+            target,
+            delta_version=delta_version,
+            instruments=instruments,
+            video_names=video_names,
+            labeled_since=labeled_since,
+        )
+    if data_source != "lakebase":
+        raise HTTPException(400, f"unknown data_source {data_source!r}; expected lakebase|delta")
+    if not _lakebase_available():
+        raise HTTPException(503, "Lakebase not configured — set data_source='delta' to read from a Delta table instead")
     # Combine snapshot_id (legacy) + snapshot_ids (new) into one list
     snap_ids = list(snapshot_ids or [])
     if snapshot_id and snapshot_id not in snap_ids:
@@ -2126,6 +2238,9 @@ class PreviewRequest(BaseModel):
     snapshot_ids: Optional[List[str]] = None
     video_names: Optional[List[str]] = None
     labeled_since: Optional[str] = None
+    data_source: str = "lakebase"
+    delta_table: Optional[str] = None
+    delta_version: Optional[int] = None
 
 
 @app.post("/api/training/preview")
@@ -2133,14 +2248,28 @@ def preview_finetune_labels(req: PreviewRequest):
     """Live count + class breakdown for the Refine tab's filter UI.
     Same logic as the training submit's data pull, so the count the user
     sees in the preview is exactly what the job will train on."""
-    if not _lakebase_available():
+    # For lakebase source, gracefully return an empty preview when
+    # Postgres isn't reachable (the Refine tab will still render). For
+    # Delta source we want the user to see the actual error since they
+    # explicitly chose it.
+    if req.data_source == "lakebase" and not _lakebase_available():
         return {"total": 0, "by_instrument": []}
-    rows = _query_finetune_labels(
-        snapshot_ids=req.snapshot_ids,
-        instruments=req.instruments,
-        video_names=req.video_names,
-        labeled_since=req.labeled_since,
-    )
+    try:
+        rows = _query_finetune_labels(
+            data_source=req.data_source,
+            delta_table=req.delta_table,
+            delta_version=req.delta_version,
+            snapshot_ids=req.snapshot_ids,
+            instruments=req.instruments,
+            video_names=req.video_names,
+            labeled_since=req.labeled_since,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Surface as a typed 4xx so the UI can render the message in the
+        # preview area without breaking the whole tab.
+        raise HTTPException(500, f"preview failed: {e}")
     counts: Dict[str, int] = {}
     for r in rows:
         c = r["instrument"] or "(unlabeled)"
@@ -2157,6 +2286,19 @@ class FineTuneRequest(BaseModel):
     uc_model_name: Optional[str] = None  # e.g. "vlmwb_ft_qwen3vl_<ts>". Auto-generated if None.
     train_prompt: Optional[str] = None
 
+    # ── Label source ────────────────────────────────────────────────────
+    # `lakebase` (default) reads from the live Postgres frame_labels table.
+    # `delta` reads from a UC Delta table — by default the one the Label
+    # tab's "Sync to Delta" button writes (frame_labels_delta), but the
+    # user can override with any 3-part Delta name (`<catalog>.<schema>.<table>`)
+    # as long as it exposes `frame_path / instrument / anatomy /
+    # tissue_condition / created_at` columns. Delta is useful for:
+    #   • training on a stable, versioned snapshot (Lakebase mutates)
+    #   • training on labels imported from other tools
+    #   • time-travel via `delta_version`
+    data_source: str = "lakebase"
+    delta_table: Optional[str] = None                       # NEW — Delta override
+    delta_version: Optional[int] = None                     # NEW — Delta time-travel
     # ── Label filters (composed with AND) ───────────────────────────────
     # Each is optional; an empty / null value means "no restriction on this
     # dimension". When multiple are provided, the resulting frame set is
@@ -2164,7 +2306,7 @@ class FineTuneRequest(BaseModel):
     # many frames match the current filter combo via /api/training/preview.
     label_filter_instruments: Optional[List[str]] = None   # by instrument class
     snapshot_id: Optional[str] = None                       # legacy single-snapshot filter
-    snapshot_ids: Optional[List[str]] = None                # NEW — multiple snapshots
+    snapshot_ids: Optional[List[str]] = None                # NEW — multiple snapshots (Lakebase only)
     video_names: Optional[List[str]] = None                 # NEW — by source video
     labeled_since: Optional[str] = None                     # NEW — ISO date; labels created on/after
 
@@ -2206,10 +2348,15 @@ def kick_off_finetune(req: FineTuneRequest):
         or f"{LOCAL_MODELS_DIR}/{req.base_model_name}/snapshot"
     )
 
-    # Pull labeled training data from Lakebase. All filters compose with AND.
-    # Implementation factored so the matching frame-paths logic is reusable
-    # by the Refine tab's live preview endpoint (no duplicated query).
+    # Pull labeled training data. Filters compose with AND. The
+    # data_source picker (lakebase | delta) lets users either hit the
+    # live Lakebase frame_labels table or read a stable Delta snapshot
+    # (e.g., what the Label tab's `Sync to Delta` button writes). Same
+    # downstream pipeline regardless of source.
     training_data = _query_finetune_labels(
+        data_source=req.data_source,
+        delta_table=req.delta_table,
+        delta_version=req.delta_version,
         snapshot_id=req.snapshot_id,
         snapshot_ids=req.snapshot_ids,
         instruments=req.label_filter_instruments,

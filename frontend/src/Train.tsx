@@ -70,6 +70,11 @@ export default function Train() {
   // ── form state (persisted) ────────────────────────────────────────
   const [baseModel, setBaseModel] = usePersistentState<string>("vlmwb.train.baseModel", "qwen3-vl-8b");
   const [ucModelName, setUcModelName] = usePersistentState<string>("vlmwb.train.ucName", "");
+  // Data source for labels — Lakebase (live, default) or a Delta table
+  // (versioned snapshot, written by Label tab's "Sync to Delta").
+  const [dataSource, setDataSource] = usePersistentState<"lakebase" | "delta">("vlmwb.train.source", "lakebase");
+  const [deltaTable, setDeltaTable] = usePersistentState<string>("vlmwb.train.deltaTable", "");
+  const [deltaVersion, setDeltaVersion] = usePersistentState<string>("vlmwb.train.deltaVersion", "");
   // Filters (all AND-composed; empty = no restriction)
   const [filterSnapshots, setFilterSnapshots] = usePersistentState<string[]>("vlmwb.train.snapshots.v2", []);
   const [filterInstruments, setFilterInstruments] = usePersistentState<string[]>("vlmwb.train.instruments", []);
@@ -97,17 +102,25 @@ export default function Train() {
 
   // Live preview: how many labels actually match the current filters
   const [preview, setPreview] = useState<{ total: number; by_instrument: { instrument: string; n: number }[] } | null>(null);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
   useEffect(() => {
     const t = setTimeout(() => {
+      const parsedVer = deltaVersion.trim() ? parseInt(deltaVersion.trim(), 10) : undefined;
       api.finetunePreview({
+        data_source: dataSource,
+        delta_table: dataSource === "delta" && deltaTable.trim() ? deltaTable.trim() : undefined,
+        delta_version: dataSource === "delta" && parsedVer !== undefined && !Number.isNaN(parsedVer) ? parsedVer : undefined,
         instruments: filterInstruments.length ? filterInstruments : undefined,
-        snapshot_ids: filterSnapshots.length ? filterSnapshots : undefined,
+        // snapshot_ids is Lakebase-only; skip when reading from Delta
+        snapshot_ids: dataSource === "lakebase" && filterSnapshots.length ? filterSnapshots : undefined,
         video_names: filterVideos.length ? filterVideos : undefined,
         labeled_since: labeledSince || undefined,
-      }).then(setPreview).catch(() => setPreview(null));
+      }).then((p) => { setPreview(p); setPreviewErr(null); })
+        .catch((e) => { setPreview(null); setPreviewErr((e as Error).message); });
     }, 300);  // debounce filter clicks
     return () => clearTimeout(t);
   }, [
+    dataSource, deltaTable, deltaVersion,
     filterInstruments.join(","),
     filterSnapshots.join(","),
     filterVideos.join(","),
@@ -208,12 +221,16 @@ export default function Train() {
     setSubmitting(true);
     setError(null);
     try {
+      const parsedVer = deltaVersion.trim() ? parseInt(deltaVersion.trim(), 10) : undefined;
       const r = await api.finetuneSubmit({
         base_model_name: baseModel,
         uc_model_name: ucModelName.trim() || undefined,
         train_prompt: trainPrompt.trim() || undefined,
+        data_source: dataSource,
+        delta_table: dataSource === "delta" && deltaTable.trim() ? deltaTable.trim() : undefined,
+        delta_version: dataSource === "delta" && parsedVer !== undefined && !Number.isNaN(parsedVer) ? parsedVer : undefined,
         label_filter_instruments: filterInstruments.length ? filterInstruments : undefined,
-        snapshot_ids: filterSnapshots.length ? filterSnapshots : undefined,
+        snapshot_ids: dataSource === "lakebase" && filterSnapshots.length ? filterSnapshots : undefined,
         video_names: filterVideos.length ? filterVideos : undefined,
         labeled_since: labeledSince || undefined,
         num_epochs: numEpochs,
@@ -351,14 +368,16 @@ export default function Train() {
           </div>
 
           {/* ── Label filters ─────────────────────────────────────────
-              Filters compose with AND. Empty = no restriction. Live preview
-              shows the exact count training will consume so the user knows
-              what they're committing to before clicking Start. */}
+              Source picker first (Lakebase vs Delta), then composable
+              AND filters. Live preview shows the exact count training
+              will consume so the user knows what they're committing to. */}
           <div className="rounded-md border bg-muted/30 p-3 space-y-3">
             <div className="flex items-baseline justify-between">
-              <Label className="text-xs font-medium">Label filters</Label>
+              <Label className="text-xs font-medium">Training data source</Label>
               <div className="text-xs">
-                {preview ? (
+                {previewErr ? (
+                  <span className="text-destructive" title={previewErr}>preview error</span>
+                ) : preview ? (
                   <span className={cn(
                     preview.total < 4 ? "text-destructive" :
                     preview.total < 30 ? "text-amber-600 dark:text-amber-500" :
@@ -372,6 +391,53 @@ export default function Train() {
               </div>
             </div>
 
+            <div className="flex gap-1">
+              {(["lakebase", "delta"] as const).map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setDataSource(s)}
+                  className={cn(
+                    "flex-1 rounded border px-2 py-1 text-xs",
+                    dataSource === s ? "bg-primary text-primary-foreground" : "bg-card hover:bg-accent",
+                  )}
+                  title={s === "lakebase"
+                    ? "Live labels from Lakebase Postgres (every saved label, mutates)"
+                    : "Stable snapshot from a UC Delta table — default is the one Label tab's 'Sync to Delta' writes"}
+                >
+                  {s === "lakebase" ? "Lakebase (live)" : "Delta table"}
+                </button>
+              ))}
+            </div>
+
+            {dataSource === "delta" && (
+              <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                <div className="space-y-1">
+                  <Label className="text-[11px] text-muted-foreground">
+                    Delta table (3-part UC name; blank = synced default)
+                  </Label>
+                  <Input
+                    value={deltaTable}
+                    placeholder={`${ucCatalog}.${ucSchema}.frame_labels_delta`}
+                    className="h-8 font-mono text-xs"
+                    onChange={(e) => setDeltaTable(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[11px] text-muted-foreground">
+                    Version (Delta time-travel; blank = latest)
+                  </Label>
+                  <Input
+                    type="number" min={0} step={1}
+                    value={deltaVersion}
+                    placeholder="latest"
+                    className="h-8 text-xs"
+                    onChange={(e) => setDeltaVersion(e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
+
+            {dataSource === "lakebase" && (
             <div className="space-y-1.5">
               <Label className="text-[11px] text-muted-foreground">Snapshots (multi-select)</Label>
               <div className="flex flex-wrap gap-1">
@@ -393,6 +459,7 @@ export default function Train() {
                 ))}
               </div>
             </div>
+            )}
 
             <div className="space-y-1.5">
               <Label className="text-[11px] text-muted-foreground">Instrument classes (multi-select)</Label>
