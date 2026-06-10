@@ -482,12 +482,23 @@ export const api = {
     base_model_name: string;
     uc_model_name?: string;
     train_prompt?: string;
+    // Label filter dimensions — all optional, composed with AND.
     label_filter_instruments?: string[];
-    snapshot_id?: string;
+    snapshot_id?: string;          // legacy single field; kept for back-compat
+    snapshot_ids?: string[];       // multi-select
+    video_names?: string[];
+    labeled_since?: string;        // ISO date string
+    // Hyperparams
     num_epochs?: number;
     learning_rate?: number;
     lora_r?: number;
     lora_alpha?: number;
+    lora_dropout?: number;
+    per_device_batch_size?: number;
+    grad_accum_steps?: number;
+    warmup_ratio?: number;
+    weight_decay?: number;
+    max_length?: number;
     accelerator?: string;
   }) =>
     fetch("/api/training/finetune", {
@@ -501,6 +512,21 @@ export const api = {
       output_dir: string;
       uc_model_name: string;
       n_train: number;
+    }>),
+
+  finetunePreview: (body: {
+    instruments?: string[];
+    snapshot_ids?: string[];
+    video_names?: string[];
+    labeled_since?: string;
+  }) =>
+    fetch("/api/training/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(asJson<{
+      total: number;
+      by_instrument: { instrument: string; n: number }[];
     }>),
 
   finetuneStatus: (run_id: string, databricks_run_id: string) =>

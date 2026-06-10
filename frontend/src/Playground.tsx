@@ -746,15 +746,15 @@ export default function Playground({
     selectedFrames.size > 0 &&
     (selectedModels.size > 0 || selectedLocalModels.size > 0);
 
+  // The right column carries a wide model-results table that can grow
+  // well past viewport width when many models are selected. We pin the
+  // left panel to a readable 320–360px range and let the right column
+  // overflow horizontally inside its own scroll container, instead of
+  // the grid squeezing the left panel into a single-character strip
+  // (which is what `minmax(0, ...)` does when the right side wants more
+  // space than is available). `min-w-0` on the right cell prevents flex
+  // children inside from pushing the column wider than the grid track.
   return (
-    {/* The right column carries a wide model-results table that can grow
-        well past viewport width when many models are selected. We pin the
-        left panel to a readable 320–360px range and let the right column
-        overflow horizontally inside its own scroll container, instead of
-        the grid squeezing the left panel into a single-character strip
-        (which is what `minmax(0, ...)` does when the right side wants more
-        space than is available). `min-w-0` on the right cell prevents flex
-        children inside from pushing the column wider than the grid track. */}
     <div className="grid gap-6 lg:grid-cols-[minmax(320px,360px)_minmax(0,1fr)]">
       {/* ─── LEFT COLUMN: selection panel ─────────────────────────────── */}
       <div className="min-w-0 space-y-4 lg:sticky lg:top-20 lg:self-start">

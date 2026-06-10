@@ -1962,16 +1962,143 @@ DEFAULT_FT_PROMPT = (
 )
 
 
+def _query_finetune_labels(
+    *,
+    snapshot_id: Optional[str] = None,
+    snapshot_ids: Optional[List[str]] = None,
+    instruments: Optional[List[str]] = None,
+    video_names: Optional[List[str]] = None,
+    labeled_since: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    """Resolve labels matching the (composable) Refine-tab filters.
+    Used by both the live preview endpoint and the actual training submit
+    so the matching set stays identical across the two.
+
+    Filters all compose with AND:
+      - instruments      : restrict to these instrument classes
+      - snapshot_id      : legacy single-snapshot field (kept for back-compat)
+      - snapshot_ids     : multi-select snapshots (union of their frame_paths)
+      - video_names      : labels for frames extracted from these videos
+      - labeled_since    : ISO date — labels created at or after this date
+
+    Joins `frame_labels` against `extracted_frames_index` so orphan labels
+    pointing at re-ingested-then-deleted JPGs don't sneak into training and
+    break the notebook with FileNotFoundError mid-epoch.
+    """
+    # Combine snapshot_id (legacy) + snapshot_ids (new) into one list
+    snap_ids = list(snapshot_ids or [])
+    if snapshot_id and snapshot_id not in snap_ids:
+        snap_ids.append(snapshot_id)
+
+    snapshot_frame_paths: Optional[List[str]] = None
+    if snap_ids:
+        with _pg_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT frame_paths FROM snapshots WHERE id = ANY(%s)",
+                (snap_ids,),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(404, f"none of snapshots {snap_ids} found")
+        # Union of every snapshot's frame_paths
+        snapshot_frame_paths = sorted({fp for r in rows for fp in (r[0] or [])})
+
+    with _pg_conn() as conn, conn.cursor() as cur:
+        clauses: List[str] = ["efi.frame_path IS NOT NULL"]
+        params: List[object] = []
+        if instruments:
+            clauses.append("fl.instrument = ANY(%s)")
+            params.append(instruments)
+        if snapshot_frame_paths is not None:
+            clauses.append("fl.frame_path = ANY(%s)")
+            params.append(snapshot_frame_paths)
+        if video_names:
+            # Frames track their source video via the videos JOIN — frame_path
+            # contains the video name as a path segment, so a LIKE pattern is
+            # the simplest cross-platform match without restructuring the schema.
+            # Build N ORs explicitly so each pattern is parameterized.
+            like_clauses = []
+            for v in video_names:
+                like_clauses.append("fl.frame_path LIKE %s")
+                params.append(f"%/{v}/%")
+            clauses.append("(" + " OR ".join(like_clauses) + ")")
+        if labeled_since:
+            clauses.append("fl.created_at >= %s::timestamptz")
+            params.append(labeled_since)
+        where = " WHERE " + " AND ".join(clauses)
+        cur.execute(
+            f"SELECT fl.frame_path, fl.instrument, fl.anatomy, fl.tissue_condition "
+            f"FROM frame_labels fl "
+            f"INNER JOIN extracted_frames_index efi ON efi.frame_path = fl.frame_path"
+            f"{where} "
+            f"ORDER BY fl.created_at",
+            tuple(params),
+        )
+        rows = cur.fetchall()
+    return [
+        {"image_path": r[0], "instrument": r[1], "anatomy": r[2], "tissue_condition": r[3]}
+        for r in rows
+    ]
+
+
+class PreviewRequest(BaseModel):
+    instruments: Optional[List[str]] = None
+    snapshot_ids: Optional[List[str]] = None
+    video_names: Optional[List[str]] = None
+    labeled_since: Optional[str] = None
+
+
+@app.post("/api/training/preview")
+def preview_finetune_labels(req: PreviewRequest):
+    """Live count + class breakdown for the Refine tab's filter UI.
+    Same logic as the training submit's data pull, so the count the user
+    sees in the preview is exactly what the job will train on."""
+    if not _lakebase_available():
+        return {"total": 0, "by_instrument": []}
+    rows = _query_finetune_labels(
+        snapshot_ids=req.snapshot_ids,
+        instruments=req.instruments,
+        video_names=req.video_names,
+        labeled_since=req.labeled_since,
+    )
+    counts: Dict[str, int] = {}
+    for r in rows:
+        c = r["instrument"] or "(unlabeled)"
+        counts[c] = counts.get(c, 0) + 1
+    return {
+        "total": len(rows),
+        "by_instrument": [{"instrument": k, "n": v}
+                          for k, v in sorted(counts.items(), key=lambda kv: -kv[1])],
+    }
+
+
 class FineTuneRequest(BaseModel):
     base_model_name: str  # one of local_models/ entries (e.g. "qwen3-vl-8b")
     uc_model_name: Optional[str] = None  # e.g. "vlmwb_ft_qwen3vl_<ts>". Auto-generated if None.
     train_prompt: Optional[str] = None
-    label_filter_instruments: Optional[List[str]] = None  # restrict to these classes
-    snapshot_id: Optional[str] = None  # restrict training to labels for frames in this snapshot
+
+    # ── Label filters (composed with AND) ───────────────────────────────
+    # Each is optional; an empty / null value means "no restriction on this
+    # dimension". When multiple are provided, the resulting frame set is
+    # the intersection. Frontend (Refine tab) shows a live preview of how
+    # many frames match the current filter combo via /api/training/preview.
+    label_filter_instruments: Optional[List[str]] = None   # by instrument class
+    snapshot_id: Optional[str] = None                       # legacy single-snapshot filter
+    snapshot_ids: Optional[List[str]] = None                # NEW — multiple snapshots
+    video_names: Optional[List[str]] = None                 # NEW — by source video
+    labeled_since: Optional[str] = None                     # NEW — ISO date; labels created on/after
+
+    # ── Hyperparams (everything threaded through to the notebook YAML) ──
     num_epochs: float = 3
     learning_rate: float = 2e-4
     lora_r: int = 16
     lora_alpha: int = 32
+    lora_dropout: float = 0.05                              # NEW
+    per_device_batch_size: int = 1                          # NEW
+    grad_accum_steps: int = 8                               # NEW
+    warmup_ratio: float = 0.03                              # NEW
+    weight_decay: float = 0.0                               # NEW
+    max_length: int = 1024                                  # NEW
     accelerator: str = "GPU_8xH100"  # bigger model + bigger batch wants more GPUs
 
 
@@ -1999,50 +2126,16 @@ def kick_off_finetune(req: FineTuneRequest):
         or f"{LOCAL_MODELS_DIR}/{req.base_model_name}/snapshot"
     )
 
-    # Pull labeled training data from Lakebase. The two optional filters
-    # (instrument class + snapshot_id) compose: any label that matches BOTH
-    # passes through. snapshot_id scopes training to the frames covered by
-    # that snapshot — useful when a single video drives the experiment.
-    snapshot_frame_paths: Optional[List[str]] = None
-    if req.snapshot_id:
-        with _pg_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT frame_paths FROM snapshots WHERE id = %s",
-                (req.snapshot_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, f"snapshot {req.snapshot_id} not found")
-            snapshot_frame_paths = row[0] or []
-    # INNER JOIN on extracted_frames_index so we only train on labels whose
-    # frames still physically exist on the Volume. Re-ingest replaces the
-    # frame set for a video — orphaned labels (pointing at deleted JPGs)
-    # would otherwise break the training job with FileNotFoundError. Lakebase
-    # is the single source of truth: extracted_frames_index is the index of
-    # what's currently on disk, frame_labels is the human gold-truth layer
-    # on top of it, and we always intersect when reading for downstream use.
-    with _pg_conn() as conn, conn.cursor() as cur:
-        clauses, params = ["efi.frame_path IS NOT NULL"], []
-        if req.label_filter_instruments:
-            clauses.append("fl.instrument = ANY(%s)")
-            params.append(req.label_filter_instruments)
-        if snapshot_frame_paths is not None:
-            clauses.append("fl.frame_path = ANY(%s)")
-            params.append(snapshot_frame_paths)
-        where = " WHERE " + " AND ".join(clauses)
-        cur.execute(
-            f"SELECT fl.frame_path, fl.instrument, fl.anatomy, fl.tissue_condition "
-            f"FROM frame_labels fl "
-            f"INNER JOIN extracted_frames_index efi ON efi.frame_path = fl.frame_path"
-            f"{where} "
-            f"ORDER BY fl.created_at",
-            tuple(params),
-        )
-        rows = cur.fetchall()
-    training_data = [
-        {"image_path": r[0], "instrument": r[1], "anatomy": r[2], "tissue_condition": r[3]}
-        for r in rows
-    ]
+    # Pull labeled training data from Lakebase. All filters compose with AND.
+    # Implementation factored so the matching frame-paths logic is reusable
+    # by the Refine tab's live preview endpoint (no duplicated query).
+    training_data = _query_finetune_labels(
+        snapshot_id=req.snapshot_id,
+        snapshot_ids=req.snapshot_ids,
+        instruments=req.label_filter_instruments,
+        video_names=req.video_names,
+        labeled_since=req.labeled_since,
+    )
     if len(training_data) < 4:
         raise HTTPException(
             400,
@@ -2070,14 +2163,19 @@ def kick_off_finetune(req: FineTuneRequest):
         "hf_secret_scope": HF_SECRET_SCOPE,
         "hf_secret_key": HF_SECRET_KEY,
         "local_models_dir": LOCAL_MODELS_DIR,
-        "lora": {"r": req.lora_r, "alpha": req.lora_alpha, "dropout": 0.05},
+        "lora": {
+            "r": req.lora_r,
+            "alpha": req.lora_alpha,
+            "dropout": req.lora_dropout,
+        },
         "training": {
             "num_epochs": req.num_epochs,
-            "per_device_train_batch_size": 1,
-            "gradient_accumulation_steps": 8,
+            "per_device_train_batch_size": req.per_device_batch_size,
+            "gradient_accumulation_steps": req.grad_accum_steps,
             "learning_rate": req.learning_rate,
-            "warmup_ratio": 0.03,
-            "max_length": 1024,
+            "warmup_ratio": req.warmup_ratio,
+            "weight_decay": req.weight_decay,
+            "max_length": req.max_length,
         },
     }
     yaml_text = yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True)

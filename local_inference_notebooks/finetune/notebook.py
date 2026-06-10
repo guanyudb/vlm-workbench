@@ -397,11 +397,18 @@ with mlflow.start_run(run_name=RUN_ID) as run:
     if tk_ver:
         pip_reqs.append(f"tokenizers=={tk_ver}")
     print(f"[ft] pinning pip_requirements: {pip_reqs}")
+    # IMPORTANT: pass torch_dtype=torch.bfloat16 so the reloaded model uses
+    # bfloat16 at serve time. Without this, MLflow stores torch_dtype: null
+    # in MLmodel and the HF pipeline reloads in fp32, OOM'ing a 24 GB A10.
+    # The working pattern is also to pass a PATH (merged_dir) — not a dict —
+    # so MLflow's Pipeline-creation validation doesn't fight the multimodal
+    # Processor. We're already passing the path; we only needed to add dtype.
     mlflow.transformers.log_model(
         transformers_model=merged_dir,
         name="finetuned_model",
         registered_model_name=UC_FULL,
         task="image-text-to-text",
+        torch_dtype=torch.bfloat16,
         signature=signature,
         metadata={
             "source_model": BASE_MODEL_DIR,

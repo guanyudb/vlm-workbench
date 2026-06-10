@@ -64,13 +64,49 @@ export default function Train() {
   // ── form state (persisted) ────────────────────────────────────────
   const [baseModel, setBaseModel] = usePersistentState<string>("vlmwb.train.baseModel", "qwen3-vl-8b");
   const [ucModelName, setUcModelName] = usePersistentState<string>("vlmwb.train.ucName", "");
-  const [snapshotId, setSnapshotId] = usePersistentState<string>("vlmwb.train.snapshotId", "__all__");
+  // Filters (all AND-composed; empty = no restriction)
+  const [filterSnapshots, setFilterSnapshots] = usePersistentState<string[]>("vlmwb.train.snapshots.v2", []);
+  const [filterInstruments, setFilterInstruments] = usePersistentState<string[]>("vlmwb.train.instruments", []);
+  const [filterVideos, setFilterVideos] = usePersistentState<string[]>("vlmwb.train.videos", []);
+  const [labeledSince, setLabeledSince] = usePersistentState<string>("vlmwb.train.since", "");
   const [trainPrompt, setTrainPrompt] = usePersistentState<string>("vlmwb.train.prompt", DEFAULT_FT_PROMPT);
+  // Hyperparams. Beginner panel: epochs + capacity preset. Advanced collapses
+  // the rest. Capacity preset maps to LoRA r so users don't see "rank".
   const [numEpochs, setNumEpochs] = usePersistentState<number>("vlmwb.train.epochs", 3);
+  const [capacity, setCapacity] = usePersistentState<"S" | "M" | "L">("vlmwb.train.capacity", "M");
   const [learningRate, setLearningRate] = usePersistentState<number>("vlmwb.train.lr", 0.0002);
-  const [loraR, setLoraR] = usePersistentState<number>("vlmwb.train.loraR", 16);
+  const [loraAlpha, setLoraAlpha] = usePersistentState<number>("vlmwb.train.loraAlpha", 32);
+  const [loraDropout, setLoraDropout] = usePersistentState<number>("vlmwb.train.loraDropout", 0.05);
+  const [batchSize, setBatchSize] = usePersistentState<number>("vlmwb.train.batch", 1);
+  const [gradAccum, setGradAccum] = usePersistentState<number>("vlmwb.train.gradAccum", 8);
+  const [warmupRatio, setWarmupRatio] = usePersistentState<number>("vlmwb.train.warmup", 0.03);
+  const [weightDecay, setWeightDecay] = usePersistentState<number>("vlmwb.train.wd", 0.0);
+  const [maxLength, setMaxLength] = usePersistentState<number>("vlmwb.train.maxLen", 1024);
   const [accelerator, setAccelerator] = usePersistentState<string>("vlmwb.train.accel", "GPU_1xA10");
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Capacity preset → LoRA rank. Higher = more learnable params + more
+  // overfit risk on small datasets. 16 is a reasonable middle for the
+  // typical workbench dataset size (10–200 labels).
+  const loraR = capacity === "S" ? 8 : capacity === "L" ? 32 : 16;
+
+  // Live preview: how many labels actually match the current filters
+  const [preview, setPreview] = useState<{ total: number; by_instrument: { instrument: string; n: number }[] } | null>(null);
+  useEffect(() => {
+    const t = setTimeout(() => {
+      api.finetunePreview({
+        instruments: filterInstruments.length ? filterInstruments : undefined,
+        snapshot_ids: filterSnapshots.length ? filterSnapshots : undefined,
+        video_names: filterVideos.length ? filterVideos : undefined,
+        labeled_since: labeledSince || undefined,
+      }).then(setPreview).catch(() => setPreview(null));
+    }, 300);  // debounce filter clicks
+    return () => clearTimeout(t);
+  }, [
+    filterInstruments.join(","),
+    filterSnapshots.join(","),
+    filterVideos.join(","),
+    labeledSince,
+  ]);
 
   // ── active runs (persisted) ───────────────────────────────────────
   const [activeRuns, setActiveRuns] = usePersistentState<ActiveFT[]>("vlmwb.train.active", []);
@@ -141,8 +177,26 @@ export default function Train() {
   }, [activeRuns.filter((r) => r.state === "running" || r.state === "submitting").map((r) => r.run_id).join(",")]);
 
   const totalLabels = labelStats?.total ?? 0;
-  const canTrain = totalLabels >= 4 && !!baseModel && !submitting;
+  // The matched count (from preview) is what training will actually receive.
+  // Fall back to totalLabels when no filters are set and the preview hasn't
+  // resolved yet, so the user isn't staring at "0" on first paint.
+  const matchedLabels =
+    (preview?.total ?? null) !== null
+      ? preview!.total
+      : (filterInstruments.length || filterSnapshots.length || filterVideos.length || labeledSince
+          ? 0
+          : totalLabels);
+  const canTrain = matchedLabels >= 4 && !!baseModel && !submitting;
 
+  // Derived: every distinct video that has at least one labeled frame.
+  // Source the list from extracted_frames index via the videos field on the
+  // labels stats response — but we don't have that endpoint yet. Cheap
+  // workaround: parse the frame_paths in `preview` if present; otherwise
+  // derive from snapshots' frame_paths. (The chosen UI doesn't NEED a
+  // strict list — users can type a video name and we'll do a LIKE match
+  // server-side. So we surface the list as a convenience but accept any
+  // string.) For Phase 1 we just expose snapshot names + a free-form video
+  // field; videos filter is "tag-input" style.
   const submitTrain = async () => {
     if (!canTrain) return;
     setSubmitting(true);
@@ -152,10 +206,20 @@ export default function Train() {
         base_model_name: baseModel,
         uc_model_name: ucModelName.trim() || undefined,
         train_prompt: trainPrompt.trim() || undefined,
-        snapshot_id: snapshotId === "__all__" ? undefined : snapshotId,
+        label_filter_instruments: filterInstruments.length ? filterInstruments : undefined,
+        snapshot_ids: filterSnapshots.length ? filterSnapshots : undefined,
+        video_names: filterVideos.length ? filterVideos : undefined,
+        labeled_since: labeledSince || undefined,
         num_epochs: numEpochs,
         learning_rate: learningRate,
         lora_r: loraR,
+        lora_alpha: loraAlpha,
+        lora_dropout: loraDropout,
+        per_device_batch_size: batchSize,
+        grad_accum_steps: gradAccum,
+        warmup_ratio: warmupRatio,
+        weight_decay: weightDecay,
+        max_length: maxLength,
         accelerator: accelerator,
       });
       setActiveRuns((cur) => [
@@ -177,6 +241,12 @@ export default function Train() {
     }
   };
 
+  // ── Toggle helpers for multi-select filters ─────────────────────────
+  const toggleIn = <T,>(arr: T[], v: T): T[] =>
+    arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v];
+  const TOGGLED = (arr: string[], v: string) =>
+    arr.includes(v) ? "bg-primary text-primary-foreground" : "bg-card hover:bg-accent";
+
   const dismissActive = (id: string) => {
     setActiveRuns((cur) => cur.filter((r) => r.run_id !== id));
   };
@@ -191,7 +261,7 @@ export default function Train() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold">Train</h1>
+        <h1 className="text-2xl font-semibold">Refine</h1>
         <p className="text-sm text-muted-foreground">
           Fine-tune a local VLM on your labeled frames. The result registers in Unity Catalog and
           shows up as a selectable model in Playground.
@@ -274,25 +344,99 @@ export default function Train() {
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <Label className="text-xs">Label scope</Label>
-            <Select value={snapshotId} onValueChange={setSnapshotId}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="__all__">
-                  All labels ({totalLabels})
-                </SelectItem>
+          {/* ── Label filters ─────────────────────────────────────────
+              Filters compose with AND. Empty = no restriction. Live preview
+              shows the exact count training will consume so the user knows
+              what they're committing to before clicking Start. */}
+          <div className="rounded-md border bg-muted/30 p-3 space-y-3">
+            <div className="flex items-baseline justify-between">
+              <Label className="text-xs font-medium">Label filters</Label>
+              <div className="text-xs">
+                {preview ? (
+                  <span className={cn(
+                    preview.total < 4 ? "text-destructive" :
+                    preview.total < 30 ? "text-amber-600 dark:text-amber-500" :
+                    "text-muted-foreground",
+                  )}>
+                    <span className="font-medium tabular-nums">{preview.total}</span> labels matched
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground">…</span>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-[11px] text-muted-foreground">Snapshots (multi-select)</Label>
+              <div className="flex flex-wrap gap-1">
+                {snapshots.length === 0 && (
+                  <span className="text-[11px] text-muted-foreground/70">No snapshots yet — save one from Playground first to use this filter.</span>
+                )}
                 {snapshots.map((s) => (
-                  <SelectItem key={s.id} value={s.id}>
-                    {s.name} ({s.n_frames} frames)
-                  </SelectItem>
+                  <button
+                    key={s.id}
+                    onClick={() => setFilterSnapshots((cur) => toggleIn(cur, s.id))}
+                    className={cn(
+                      "rounded border px-2 py-0.5 text-[11px] transition-colors",
+                      TOGGLED(filterSnapshots, s.id),
+                    )}
+                    title={`${s.n_frames} frames · ${s.created_at?.slice(0, 10)}`}
+                  >
+                    {s.name}
+                  </button>
                 ))}
-              </SelectContent>
-            </Select>
-            <p className="text-[10px] text-muted-foreground">
-              Restrict training to labels whose frames belong to a given snapshot — useful when
-              one video drives the experiment. Defaults to using every labeled frame.
-            </p>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-[11px] text-muted-foreground">Instrument classes (multi-select)</Label>
+              <div className="flex flex-wrap gap-1">
+                {(labelStats?.by_instrument ?? []).map((b) => (
+                  <button
+                    key={b.instrument}
+                    onClick={() => setFilterInstruments((cur) => toggleIn(cur, b.instrument))}
+                    className={cn(
+                      "rounded border px-2 py-0.5 text-[11px] transition-colors",
+                      TOGGLED(filterInstruments, b.instrument),
+                    )}
+                  >
+                    {b.instrument} <span className="opacity-60">×{b.n}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">Source videos (comma-separated, optional)</Label>
+                <Input
+                  value={filterVideos.join(", ")}
+                  placeholder="e.g. VinayVideoThing1, knee_arthroscopy_03"
+                  className="h-8 text-xs"
+                  onChange={(e) => setFilterVideos(
+                    e.target.value.split(",").map((s) => s.trim()).filter(Boolean)
+                  )}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">Labels added since (optional)</Label>
+                <Input
+                  type="date"
+                  value={labeledSince}
+                  className="h-8 text-xs"
+                  onChange={(e) => setLabeledSince(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {(filterSnapshots.length || filterInstruments.length || filterVideos.length || labeledSince) ? (
+              <button
+                onClick={() => { setFilterSnapshots([]); setFilterInstruments([]); setFilterVideos([]); setLabeledSince(""); }}
+                className="text-[11px] text-muted-foreground hover:text-foreground underline"
+              >
+                Clear all filters
+              </button>
+            ) : null}
           </div>
 
           <div>
@@ -309,63 +453,139 @@ export default function Train() {
             </p>
           </div>
 
-          {/* Advanced */}
-          <div>
-            <button
-              onClick={() => setAdvancedOpen((o) => !o)}
-              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
-            >
-              <Settings className="size-3.5" />
-              {advancedOpen ? "Hide" : "Show"} advanced
-            </button>
-            {advancedOpen && (
-              <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-4">
-                <div className="space-y-1.5">
-                  <Label className="text-xs">Epochs</Label>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={20}
-                    step={1}
-                    value={numEpochs}
-                    onChange={(e) => setNumEpochs(Number(e.target.value) || 1)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label className="text-xs">Learning rate</Label>
-                  <Input
-                    type="number"
-                    step={0.0001}
-                    min={0.00001}
-                    max={0.001}
-                    value={learningRate}
-                    onChange={(e) => setLearningRate(Number(e.target.value) || 2e-4)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label className="text-xs">LoRA r</Label>
-                  <Input
-                    type="number"
-                    min={4}
-                    max={128}
-                    step={2}
-                    value={loraR}
-                    onChange={(e) => setLoraR(Number(e.target.value) || 16)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label className="text-xs">Accelerator</Label>
-                  <Select value={accelerator} onValueChange={setAccelerator}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      {ACCELERATORS.map((a) => (
-                        <SelectItem key={a.value} value={a.value}>{a.label}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+          {/* ── Hyperparams — Beginner pane always visible ────────────
+              Two knobs that materially change outcomes for the typical
+              user: epochs (controls fit vs overfit) and capacity (LoRA
+              rank, abstracted as Small/Medium/Large). Everything else
+              lives behind the Advanced toggle. */}
+          <div className="rounded-md border bg-muted/30 p-3 space-y-3">
+            <Label className="text-xs font-medium">Training parameters</Label>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">Epochs · {numEpochs}</Label>
+                <input
+                  type="range"
+                  min={1} max={10} step={1}
+                  value={numEpochs}
+                  onChange={(e) => setNumEpochs(Number(e.target.value))}
+                  className="w-full"
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  1–2: light touch · 3: default · 6+: risk of overfitting on small data
+                </p>
               </div>
-            )}
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">Capacity</Label>
+                <div className="flex gap-1">
+                  {(["S", "M", "L"] as const).map((c) => (
+                    <button
+                      key={c}
+                      onClick={() => setCapacity(c)}
+                      className={cn(
+                        "flex-1 rounded border px-2 py-1 text-xs",
+                        capacity === c ? "bg-primary text-primary-foreground" : "bg-card hover:bg-accent",
+                      )}
+                    >
+                      {c === "S" ? "Small" : c === "M" ? "Medium" : "Large"}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-muted-foreground">
+                  LoRA rank · S=8 (least overfit), M=16, L=32 (most expressive)
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">Accelerator</Label>
+                <Select value={accelerator} onValueChange={setAccelerator}>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {ACCELERATORS.map((a) => (
+                      <SelectItem key={a.value} value={a.value}>{a.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div>
+              <button
+                onClick={() => setAdvancedOpen((o) => !o)}
+                className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                <Settings className="size-3" />
+                {advancedOpen ? "Hide" : "Show"} advanced parameters
+              </button>
+              {advancedOpen && (
+                <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">Learning rate</Label>
+                    <Input
+                      type="number" step={0.00001} min={0.00001} max={0.001}
+                      value={learningRate} className="h-8 text-xs"
+                      onChange={(e) => setLearningRate(Number(e.target.value) || 2e-4)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">LoRA alpha</Label>
+                    <Input
+                      type="number" min={1} max={256} step={1}
+                      value={loraAlpha} className="h-8 text-xs"
+                      onChange={(e) => setLoraAlpha(Number(e.target.value) || 32)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">LoRA dropout</Label>
+                    <Input
+                      type="number" step={0.01} min={0} max={0.5}
+                      value={loraDropout} className="h-8 text-xs"
+                      onChange={(e) => setLoraDropout(Number(e.target.value) || 0)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">Batch / device</Label>
+                    <Input
+                      type="number" min={1} max={32} step={1}
+                      value={batchSize} className="h-8 text-xs"
+                      onChange={(e) => setBatchSize(Number(e.target.value) || 1)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">
+                      Grad accum · effective batch {batchSize * gradAccum}
+                    </Label>
+                    <Input
+                      type="number" min={1} max={64} step={1}
+                      value={gradAccum} className="h-8 text-xs"
+                      onChange={(e) => setGradAccum(Number(e.target.value) || 1)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">Warmup ratio</Label>
+                    <Input
+                      type="number" step={0.01} min={0} max={0.5}
+                      value={warmupRatio} className="h-8 text-xs"
+                      onChange={(e) => setWarmupRatio(Number(e.target.value) || 0)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">Weight decay</Label>
+                    <Input
+                      type="number" step={0.01} min={0} max={0.5}
+                      value={weightDecay} className="h-8 text-xs"
+                      onChange={(e) => setWeightDecay(Number(e.target.value) || 0)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-[11px] text-muted-foreground">Max sequence length</Label>
+                    <Input
+                      type="number" min={256} max={4096} step={128}
+                      value={maxLength} className="h-8 text-xs"
+                      onChange={(e) => setMaxLength(Number(e.target.value) || 1024)}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           {error && (
@@ -376,11 +596,18 @@ export default function Train() {
 
           <div className="flex items-center gap-3 border-t pt-3">
             <Button onClick={submitTrain} disabled={!canTrain} className="gap-2">
-              {submitting ? <><Loader2 className="size-4 animate-spin" /> Submitting…</> : <><Sparkles className="size-4" /> Start fine-tune</>}
+              {submitting
+                ? <><Loader2 className="size-4 animate-spin" /> Submitting…</>
+                : <><Sparkles className="size-4" /> Start fine-tune on {matchedLabels} labels</>}
             </Button>
-            {totalLabels < 4 && (
+            {matchedLabels < 4 && totalLabels < 4 && (
               <span className="text-xs text-muted-foreground">
                 Label at least 4 frames in the Label tab first.
+              </span>
+            )}
+            {matchedLabels < 4 && totalLabels >= 4 && (
+              <span className="text-xs text-muted-foreground">
+                Current filters match {matchedLabels} / {totalLabels} labels — relax filters to train.
               </span>
             )}
           </div>
