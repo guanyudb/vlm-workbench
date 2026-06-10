@@ -70,11 +70,15 @@ export default function Train() {
   // ── form state (persisted) ────────────────────────────────────────
   const [baseModel, setBaseModel] = usePersistentState<string>("vlmwb.train.baseModel", "qwen3-vl-8b");
   const [ucModelName, setUcModelName] = usePersistentState<string>("vlmwb.train.ucName", "");
-  // Data source for labels — Lakebase (live, default) or a Delta table
-  // (versioned snapshot, written by Label tab's "Sync to Delta").
-  const [dataSource, setDataSource] = usePersistentState<"lakebase" | "delta">("vlmwb.train.source", "lakebase");
+  // Data source for labels. A single text input drives this:
+  //   blank          → Lakebase (live) — every saved label, mutates
+  //   catalog.schema.table → that Delta table — versioned snapshot
+  // We persist just the input text + an optional Delta version; the
+  // source mode is derived (`dataSource` below) so the UI doesn't drift
+  // out of sync with what gets sent.
   const [deltaTable, setDeltaTable] = usePersistentState<string>("vlmwb.train.deltaTable", "");
   const [deltaVersion, setDeltaVersion] = usePersistentState<string>("vlmwb.train.deltaVersion", "");
+  const dataSource: "lakebase" | "delta" = deltaTable.trim() ? "delta" : "lakebase";
   // Filters (all AND-composed; empty = no restriction)
   const [filterSnapshots, setFilterSnapshots] = usePersistentState<string[]>("vlmwb.train.snapshots.v2", []);
   const [filterInstruments, setFilterInstruments] = usePersistentState<string[]>("vlmwb.train.instruments", []);
@@ -368,16 +372,16 @@ export default function Train() {
           </div>
 
           {/* ── Label filters ─────────────────────────────────────────
-              Source picker first (Lakebase vs Delta), then composable
-              AND filters. Live preview shows the exact count training
-              will consume so the user knows what they're committing to. */}
+              A single "Source" input drives where labels come from. Blank
+              → Lakebase (live). Filled → a UC Delta table (typically
+              what the Label tab's "Sync to Delta" wrote). Composable AND
+              filters below; live preview shows the exact count training
+              will consume. */}
           <div className="rounded-md border bg-muted/30 p-3 space-y-3">
-            <div className="flex items-baseline justify-between">
-              <Label className="text-xs font-medium">Training data source</Label>
+            <div className="flex items-baseline justify-between gap-3">
+              <Label className="text-xs font-medium">Labels source</Label>
               <div className="text-xs">
-                {previewErr ? (
-                  <span className="text-destructive" title={previewErr}>preview error</span>
-                ) : preview ? (
+                {previewErr ? null : preview ? (
                   <span className={cn(
                     preview.total < 4 ? "text-destructive" :
                     preview.total < 30 ? "text-amber-600 dark:text-amber-500" :
@@ -391,50 +395,28 @@ export default function Train() {
               </div>
             </div>
 
-            <div className="flex gap-1">
-              {(["lakebase", "delta"] as const).map((s) => (
-                <button
-                  key={s}
-                  onClick={() => setDataSource(s)}
-                  className={cn(
-                    "flex-1 rounded border px-2 py-1 text-xs",
-                    dataSource === s ? "bg-primary text-primary-foreground" : "bg-card hover:bg-accent",
-                  )}
-                  title={s === "lakebase"
-                    ? "Live labels from Lakebase Postgres (every saved label, mutates)"
-                    : "Stable snapshot from a UC Delta table — default is the one Label tab's 'Sync to Delta' writes"}
-                >
-                  {s === "lakebase" ? "Lakebase (live)" : "Delta table"}
-                </button>
-              ))}
+            <div className="flex gap-2">
+              <Input
+                value={deltaTable}
+                placeholder={`Lakebase (default) — or paste ${ucCatalog}.${ucSchema}.frame_labels_delta to read Delta`}
+                className="h-8 flex-1 font-mono text-xs"
+                onChange={(e) => setDeltaTable(e.target.value)}
+              />
+              {deltaTable.trim() && (
+                <Input
+                  type="number" min={0} step={1}
+                  value={deltaVersion}
+                  placeholder="latest"
+                  className="h-8 w-24 text-xs"
+                  title="Delta time-travel: leave blank for latest, or pin to a specific version"
+                  onChange={(e) => setDeltaVersion(e.target.value)}
+                />
+              )}
             </div>
-
-            {dataSource === "delta" && (
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                <div className="space-y-1">
-                  <Label className="text-[11px] text-muted-foreground">
-                    Delta table (3-part UC name; blank = synced default)
-                  </Label>
-                  <Input
-                    value={deltaTable}
-                    placeholder={`${ucCatalog}.${ucSchema}.frame_labels_delta`}
-                    className="h-8 font-mono text-xs"
-                    onChange={(e) => setDeltaTable(e.target.value)}
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-[11px] text-muted-foreground">
-                    Version (Delta time-travel; blank = latest)
-                  </Label>
-                  <Input
-                    type="number" min={0} step={1}
-                    value={deltaVersion}
-                    placeholder="latest"
-                    className="h-8 text-xs"
-                    onChange={(e) => setDeltaVersion(e.target.value)}
-                  />
-                </div>
-              </div>
+            {previewErr && (
+              <p className="rounded bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
+                Preview failed: {previewErr}
+              </p>
             )}
 
             {dataSource === "lakebase" && (
