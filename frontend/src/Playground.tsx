@@ -1617,7 +1617,15 @@ function ResultsMatrix({
     // intrinsic width, blowing past the grid track and pushing the left
     // panel into the single-character-wide failure mode again. `max-w-full`
     // is belt-and-suspenders against any ancestor `min-content` inflation.
-    <div className="w-full max-w-full overflow-x-auto">
+    //
+    // `max-h-[60vh] overflow-y-auto` caps the matrix to ~60% viewport
+    // height so the PAGE itself doesn't grow to N rows × cell-height. With
+    // 100+ frames the old behavior forced the user to scroll the whole
+    // page (and drag past the sticky left model panel) to reach row 50;
+    // now the table scrolls internally instead. The table's `thead` is
+    // already `sticky top-0` and the first column is `sticky left-0`, so
+    // both axes have a frozen header inside the scroll container.
+    <div className="w-full max-w-full max-h-[60vh] overflow-auto">
       <table className="w-max border-collapse text-xs">
         <thead className="sticky top-0 z-10 bg-card">
           <tr>
@@ -1685,18 +1693,26 @@ function ResultsMatrix({
                 {models.map((m) => {
                   const r = results.get(`${m}::${fname}`);
                   const local = localRuns?.[m];
+                  const localInFlight = local && (local.state === "running" || local.state === "submitting");
+                  const localFailed = local && local.state === "failed";
                   return (
                     <td key={m} className="min-w-56 border-l p-2 align-top">
                       {r ? (
                         <ResultCell row={r} goldLabel={gold} />
-                      ) : local && (local.state === "running" || local.state === "submitting") ? (
+                      ) : localInFlight ? (
                         <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
                           <Loader2 className="size-3 animate-spin" /> waiting on GPU…
                         </div>
-                      ) : local && local.state === "failed" ? (
+                      ) : localFailed ? (
                         <div className="text-[11px] text-destructive" title={local.error}>job failed</div>
                       ) : (
-                        <ResultCell row={r} goldLabel={gold} />
+                        // No result + nothing in flight → this cell was
+                        // never run (or its prior result fell out of the
+                        // persisted cache). The old branch showed a hanging
+                        // "waiting…" spinner here which was misleading; the
+                        // dash communicates "not run" without implying any
+                        // pending work.
+                        <span className="text-[11px] text-muted-foreground/60">—</span>
                       )}
                     </td>
                   );

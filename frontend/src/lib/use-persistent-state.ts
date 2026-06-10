@@ -38,10 +38,22 @@ export const setStringCodec = {
   deserialize: (raw: string): Set<string> => new Set<string>(JSON.parse(raw)),
 };
 
-/** JSON serialize/deserialize for Map<string, T>. T must be JSON-safe. */
-export function mapStringCodec<T>() {
+/** JSON serialize/deserialize for Map<string, T>. T must be JSON-safe.
+ *
+ * `cap` (default 600) trims to the most-recent N entries by insertion order
+ * before serializing. This stops silent localStorage quota failures when the
+ * Map grows past ~1 MB (Playground's results matrix can hold hundreds of
+ * `{raw, parsed}` rows per session, and the old codec would let the
+ * `setItem` call throw quietly — the next reload would see no persisted
+ * state and the user would think the writes never happened). Older entries
+ * just age out; insertion order is preserved by ES2015 Maps. */
+export function mapStringCodec<T>(cap = 600) {
   return {
-    serialize: (m: Map<string, T>) => JSON.stringify(Array.from(m.entries())),
+    serialize: (m: Map<string, T>) => {
+      const entries = Array.from(m.entries());
+      const kept = entries.length > cap ? entries.slice(-cap) : entries;
+      return JSON.stringify(kept);
+    },
     deserialize: (raw: string): Map<string, T> => new Map<string, T>(JSON.parse(raw)),
   };
 }
