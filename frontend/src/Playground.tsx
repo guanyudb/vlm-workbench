@@ -1458,6 +1458,8 @@ export default function Playground({
                 results={results}
                 localRuns={localRuns}
                 labels={labels}
+                running={running}
+                gatewayModels={selectedModels}
               />
             </CardContent>
           </Card>
@@ -1578,12 +1580,20 @@ function ResultsMatrix({
   results,
   localRuns,
   labels,
+  running,
+  gatewayModels,
 }: {
   frames: string[];
   models: string[];
   results: Map<string, RunResultRow>;
   localRuns?: Record<string, { state: "submitting" | "running" | "succeeded" | "failed"; error?: string; runPageUrl?: string | null; startedAt: number }>;
   labels?: Map<string, FrameLabel>;
+  // True while either an AI Gateway batch or a local-model job is in
+  // flight. We use it together with `gatewayModels` to detect cells that
+  // should show "calling…" (model is in the AI Gateway batch + has no
+  // result yet) vs cells that just haven't been run (show "—").
+  running: boolean;
+  gatewayModels: Set<string>;
 }) {
   // Per-model accuracy across frames that have a gold label. Only counts
   // frames where the model produced a parseable predicted class.
@@ -1695,6 +1705,13 @@ function ResultsMatrix({
                   const local = localRuns?.[m];
                   const localInFlight = local && (local.state === "running" || local.state === "submitting");
                   const localFailed = local && local.state === "failed";
+                  // AI Gateway in-flight: `running` is true AND this model
+                  // is in the AI Gateway batch (i.e. not a local-only
+                  // model). Without this branch a Run click on an AI
+                  // Gateway model that has no prior result would silently
+                  // sit on "—" until the response landed — looks like the
+                  // click did nothing.
+                  const gatewayInFlight = running && gatewayModels.has(m);
                   return (
                     <td key={m} className="min-w-56 border-l p-2 align-top">
                       {r ? (
@@ -1705,13 +1722,15 @@ function ResultsMatrix({
                         </div>
                       ) : localFailed ? (
                         <div className="text-[11px] text-destructive" title={local.error}>job failed</div>
+                      ) : gatewayInFlight ? (
+                        <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                          <Loader2 className="size-3 animate-spin" /> calling…
+                        </div>
                       ) : (
                         // No result + nothing in flight → this cell was
                         // never run (or its prior result fell out of the
-                        // persisted cache). The old branch showed a hanging
-                        // "waiting…" spinner here which was misleading; the
-                        // dash communicates "not run" without implying any
-                        // pending work.
+                        // persisted cache). Dash communicates "not run"
+                        // without implying any pending work.
                         <span className="text-[11px] text-muted-foreground/60">—</span>
                       )}
                     </td>
