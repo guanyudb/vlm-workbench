@@ -531,32 +531,36 @@ export default function Playground({
     setSelectedModels(new Set(Array.from(RECOMMENDED_MODELS).filter((m) => ready.has(m))));
   };
 
-  const startRun = () => {
+  const startRun = (mode: "missing" | "all" = "missing") => {
     if (running) return;
     if (selectedFrames.size === 0) return;
     if (selectedModels.size === 0 && selectedLocalModels.size === 0) return;
 
-    // Delta semantics: keep existing results, only run missing (model,frame)
-    // cells. Common case: user adds a fine-tuned model to a panel that's
-    // already populated for the other models, hits Run, and only the new
-    // model is exercised. To force a full re-run, click "Clear" first.
+    // Delta semantics by default: keep existing results, only run missing
+    // (model, frame) cells. mode === "all" forces a re-fetch of every cell
+    // (used by the "Re-run all" button).
     const framePaths = Array.from(selectedFrames);
+    const isMissing = (m: string, p: string) =>
+      mode === "all" || !results.has(`${m}::${p.split("/").pop() || p}`);
     const gatewayMissing: Record<string, string[]> = {};
     for (const m of selectedModels) {
-      const need = framePaths.filter((p) => !results.has(`${m}::${p.split("/").pop() || p}`));
+      const need = framePaths.filter((p) => isMissing(m, p));
       if (need.length > 0) gatewayMissing[m] = need;
     }
     const localMissing: Record<string, string[]> = {};
     for (const m of selectedLocalModels) {
-      const need = framePaths.filter((p) => !results.has(`${m}::${p.split("/").pop() || p}`));
+      const need = framePaths.filter((p) => isMissing(m, p));
       if (need.length > 0) localMissing[m] = need;
     }
 
     const nGatewayCells = Object.values(gatewayMissing).reduce((a, b) => a + b.length, 0);
     const nLocalCells = Object.values(localMissing).reduce((a, b) => a + b.length, 0);
     if (nGatewayCells === 0 && nLocalCells === 0) {
-      // Everything is already filled in. Don't do anything noisy; just
-      // surface a brief signal so the user knows the click did register.
+      // Everything is already filled in. Earlier this returned silently
+      // which made clicking Run feel like it did nothing. Now we surface
+      // an explicit inline message so the user knows the click registered
+      // and what to do next.
+      setRunError("All selected (model × frame) cells already have results. Click 'Re-run all' to force-refresh, or change your selection.");
       setRunDuration(0);
       return;
     }
@@ -1073,9 +1077,23 @@ export default function Playground({
 
         <Card>
           <CardContent className="flex flex-wrap items-center gap-3 p-4">
-            <Button onClick={startRun} disabled={!canRun} variant="default" className="gap-2">
+            <Button onClick={() => startRun("missing")} disabled={!canRun} variant="default" className="gap-2">
               {running ? (<><Loader2 className="size-4 animate-spin" /> Running…</>) : (<><Play className="size-4" /> Run</>)}
             </Button>
+            {/* Force-refresh every selected (model × frame) cell — useful
+                when a prompt or task config changes and the cached results
+                are now stale. Hidden while a run is in flight. */}
+            {!running && (
+              <Button
+                onClick={() => startRun("all")}
+                disabled={!canRun}
+                variant="outline"
+                className="gap-2"
+                title="Re-run every selected cell, ignoring cached results"
+              >
+                <RefreshCcw className="size-4" /> Re-run all
+              </Button>
+            )}
             {running && (
               <Button variant="outline" onClick={stopRun} className="gap-2">
                 <Square className="size-4" /> Stop
@@ -1713,7 +1731,7 @@ function ResultsMatrix({
                   // click did nothing.
                   const gatewayInFlight = running && gatewayModels.has(m);
                   return (
-                    <td key={m} className="min-w-56 border-l p-2 align-top">
+                    <td key={m} className="w-72 min-w-56 max-w-72 border-l p-2 align-top">
                       {r ? (
                         <ResultCell row={r} goldLabel={gold} />
                       ) : localInFlight ? (
@@ -1788,7 +1806,7 @@ function ResultCell({ row, goldLabel }: { row?: RunResultRow; goldLabel?: string
       {row.parsed && typeof row.parsed === "object" && (
         <details className="text-[11px] text-muted-foreground">
           <summary className="cursor-pointer">JSON</summary>
-          <pre className="mt-1 max-h-40 overflow-auto rounded bg-muted p-1.5 font-mono text-[10px]">{JSON.stringify(row.parsed, null, 2)}</pre>
+          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-1.5 font-mono text-[10px]">{JSON.stringify(row.parsed, null, 2)}</pre>
         </details>
       )}
       {!row.parsed && row.raw && (
