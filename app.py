@@ -1514,7 +1514,10 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
     client = _openai_client()
     t0 = time.time()
 
-    def _chat(send_temperature: bool, send_response_format: bool = True) -> str:
+    def _chat(features: set) -> str:
+        """One attempt with the given feature set. `features` is the set of
+        optional kwargs we're willing to send; we drop members one at a time
+        in the caller based on which parameter the endpoint rejected."""
         kwargs = dict(
             model=model_name,
             messages=[{
@@ -1526,38 +1529,54 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
             }],
             max_tokens=max_tokens,
         )
-        if send_temperature:
+        if "temperature" in features:
             kwargs["temperature"] = temperature
         # Force JSON-mode output so the per-cell parser doesn't hit "unparsed"
-        # when a model chooses prose. Every prompt template the workbench
-        # ships already requests strict JSON, so this just enforces what was
-        # asked. Endpoints that don't accept `response_format` get retried
-        # below without it (fable-5 returns INVALID_PARAMETER_VALUE, for one).
-        if send_response_format:
+        # when a model chooses prose. The prompts already ask for strict
+        # JSON; this enforces it. Endpoints that reject `response_format`
+        # cascade through the retry below.
+        if "response_format" in features:
             kwargs["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs)
         return _extract_text(resp.choices[0].message.content)
 
+    def _chat_with_retries(features: set, attempts_left: int = 4) -> str:
+        """Cascading feature-drop retry. Some endpoints reject multiple
+        optional params (e.g. claude-fable-5 rejects BOTH `response_format`
+        and `temperature`). Earlier code dropped only one feature per
+        attempt and surfaced the second rejection as the user-visible
+        error. This loop drops features one at a time based on the error
+        message until either a request succeeds or all features have been
+        dropped."""
+        try:
+            return _chat(features)
+        except Exception as e:
+            if attempts_left <= 0:
+                raise
+            msg = str(e).lower()
+            # response_format rejection — drop it and retry. Gateway phrases
+            # the error two ways depending on adapter version:
+            #   OpenAI-style:    "response_format is not supported"
+            #   Anthropic-style: "Response format type json_object is not
+            #                     supported for this model." (fable-5)
+            if ("response_format" in msg or "response format" in msg) \
+                    and "response_format" in features:
+                return _chat_with_retries(features - {"response_format"}, attempts_left - 1)
+            # temperature rejection — Anthropic reasoning models often
+            # disallow it. "does not support" + "temperature" matches both
+            # OpenAI's and Anthropic's phrasings.
+            if "temperature" in msg and "does not support" in msg \
+                    and "temperature" in features:
+                return _chat_with_retries(features - {"temperature"}, attempts_left - 1)
+            raise
+
     try:
         try:
-            text = _chat(send_temperature=True)
+            text = _chat_with_retries({"temperature", "response_format"})
         except Exception as e:
             msg = str(e)
-            # Endpoints that reject `response_format` → retry without it.
-            # The gateway phrases this error two ways depending on
-            # adapter version:
-            #   • OpenAI-style: "response_format is not supported"
-            #   • Anthropic-style: "Response format type json_object is
-            #     not supported for this model." (fable-5 in particular)
-            # Match BOTH the underscored and space-separated forms.
-            if ("response_format" in msg.lower()
-                or "response format" in msg.lower()):
-                text = _chat(send_temperature=True, send_response_format=False)
-            # Retry without temperature for reasoning models that reject it.
-            elif "temperature" in msg.lower() and "does not support" in msg.lower():
-                text = _chat(send_temperature=False)
             # Retry via Responses API for endpoints that require it.
-            elif "responses api" in msg.lower() or "/serving-endpoints/responses" in msg.lower():
+            if "responses api" in msg.lower() or "/serving-endpoints/responses" in msg.lower():
                 text = _call_responses_api(client, model_name, frame_b64, prompt, max_tokens)
             else:
                 raise
