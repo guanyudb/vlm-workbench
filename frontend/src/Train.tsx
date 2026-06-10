@@ -41,9 +41,15 @@ type ActiveFT = {
   finished_at?: number;
 };
 
+// Serverless GPU options surfaced for fine-tune jobs. Names must match the
+// Jobs API exactly (`GPU_<N>x<TYPE>` — no `Nx` prefix → CPU silent
+// downgrade). H100 was added back per the user's workspace
+// enablement (e2-demo-field-eng has GPU_1xH100 available); availability
+// elsewhere depends on the workspace's serverless-GPU SKU list.
 const ACCELERATORS = [
-  { value: "GPU_1xA10", label: "1× A10 (slow, low cost)" },
-  { value: "GPU_8xH100", label: "8× H100 (fast, full bf16)" },
+  { value: "GPU_1xA10",  label: "1× A10 · 24 GB · cheap (best for 8B base)" },
+  { value: "GPU_1xH100", label: "1× H100 · 80 GB · fast (best for 12B+ base)" },
+  { value: "GPU_8xH100", label: "8× H100 · 640 GB · fastest (overkill for LoRA)" },
 ];
 
 export default function Train() {
