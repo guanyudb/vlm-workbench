@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, ChevronRight } from "lucide-react";
+import { AlertTriangle, ChevronRight, X } from "lucide-react";
 import { api } from "@/api";
+
+const DISMISS_KEY = "vlmwb.setup-banner.dismissed";
 
 // Polls /api/setup/check every 60s. When any check fails, renders a top
 // banner pointing the user to the Setup tab. Idea borrowed from
@@ -19,6 +21,12 @@ export function SetupGateBanner({
 }) {
   const [failing, setFailing] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  // Session-scoped dismiss: hide the banner for the rest of the tab session
+  // (not localStorage — we want it to reappear on next visit if checks are
+  // still failing, since the user might have forgotten about the issue).
+  const [dismissed, setDismissed] = useState(() => {
+    try { return sessionStorage.getItem(DISMISS_KEY) === "1"; } catch { return false; }
+  });
 
   useEffect(() => {
     let alive = true;
@@ -36,7 +44,12 @@ export function SetupGateBanner({
     return () => { alive = false; clearInterval(t); };
   }, []);
 
-  if (loading || failing.length === 0 || currentRoute === "setup") return null;
+  if (loading || failing.length === 0 || currentRoute === "setup" || dismissed) return null;
+
+  const dismiss = () => {
+    try { sessionStorage.setItem(DISMISS_KEY, "1"); } catch { /* private mode */ }
+    setDismissed(true);
+  };
 
   // Cap displayed names so the banner stays one line. The Setup tab shows
   // the full list with remediation copy.
@@ -66,6 +79,13 @@ export function SetupGateBanner({
           className="inline-flex shrink-0 items-center gap-1 rounded-md border border-amber-700/40 bg-amber-100/60 px-2 py-1 text-amber-900 hover:bg-amber-100 dark:border-amber-500/30 dark:bg-amber-900/20 dark:text-amber-100 dark:hover:bg-amber-900/40"
         >
           Open Setup <ChevronRight className="size-3" />
+        </button>
+        <button
+          onClick={dismiss}
+          className="inline-flex shrink-0 items-center rounded-md p-1 text-amber-700 hover:bg-amber-200/40 dark:text-amber-300 dark:hover:bg-amber-900/40"
+          title="Dismiss for this session — banner reappears on next visit if any checks still fail"
+        >
+          <X className="size-3.5" />
         </button>
       </div>
     </div>
