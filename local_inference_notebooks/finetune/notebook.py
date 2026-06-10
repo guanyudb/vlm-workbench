@@ -351,71 +351,152 @@ with mlflow.start_run(run_name=RUN_ID) as run:
     print(f"[ft] merged model saved to {merged_dir}")
 
     # COMMAND ----------
-    # Register in Unity Catalog. We use the merged checkpoint so Playground's
-    # local-inference notebook can `from_pretrained(<snapshot_dir>)` it
-    # without needing PEFT at inference time.
-    from mlflow.models import ModelSignature
-    from mlflow.types.schema import Schema, ColSpec
+    # Register in Unity Catalog. We use a custom mlflow.pyfunc wrapper rather
+    # than the mlflow.transformers flavor because the latter fails AT SERVE
+    # TIME for custom-arch multimodal models like Qwen3-VL:
+    #
+    #   Exception: Impossible to guess which processor to use. Please provide
+    #   a processor instance or a path/identifier to a processor.
+    #
+    # mlflowserving's _load_pyfunc for the transformers flavor calls
+    # `transformers.pipeline(**conf)` without `trust_remote_code=True`. The
+    # auto-resolution of the multimodal processor needs that flag, so the
+    # pipeline crashes on container startup and Model Serving reports
+    # "Model server failed to load the model".
+    #
+    # The fix: log a `mlflow.pyfunc.PythonModel` that does
+    # AutoProcessor.from_pretrained(trust_remote_code=True) +
+    # AutoModelForImageTextToText.from_pretrained(trust_remote_code=True)
+    # in its load_context. Inference path matches local_inference_notebooks/run/notebook.py.
 
-    signature = ModelSignature(
-        inputs=Schema([ColSpec("string", "prompt"), ColSpec("binary", "image")]),
-        outputs=Schema([ColSpec("string", "generated_text")]),
-    )
-    print(f"[ft] logging + registering {UC_FULL}")
-    # Pin everything the runtime needs to import the model. We hit
-    # "operator torchvision::nms does not exist" at serve time when
-    # torchvision wasn't pinned — the conda solver picked a CUDA-11.8 wheel
-    # against a CUDA-12.6 torch, and the import failed. Pinning torchvision
-    # to the exact version captured here forces a matching pair. Also pin
-    # safetensors + tokenizers since transformers imports them at module-load.
+    import base64
+    import pandas as pd
+    from mlflow.models import infer_signature
+
+    class VLMPyfunc(mlflow.pyfunc.PythonModel):
+        """Generic VLM wrapper for Qwen3-VL, Gemma-3/4, and any model loadable
+        via AutoProcessor + AutoModelForImageTextToText. Forwards
+        trust_remote_code=True so custom-arch models load correctly."""
+
+        def load_context(self, context):
+            import torch as _torch, json as _json
+            from transformers import AutoProcessor, AutoModelForImageTextToText
+            model_path = context.artifacts["model"]
+            cfg_path = os.path.join(context.artifacts.get("cfg", ""), "serve_config.json")
+            try:
+                with open(cfg_path) as f:
+                    serve_cfg = _json.load(f)
+            except Exception:
+                serve_cfg = {}
+            dtype_str = serve_cfg.get("torch_dtype", "bfloat16")
+            self.max_new_tokens = int(serve_cfg.get("max_new_tokens", 200))
+            self.default_prompt = serve_cfg.get("default_prompt", "Describe the image.")
+            dtype = {"bfloat16": _torch.bfloat16, "float16": _torch.float16, "float32": _torch.float32}.get(dtype_str, _torch.bfloat16)
+            self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_path, torch_dtype=dtype, device_map="auto", trust_remote_code=True,
+            )
+            self.model.eval()
+
+        def _row_to_image(self, image_val):
+            from PIL import Image
+            import io as _io, base64 as _b64
+            if image_val is None:
+                raise ValueError("image is required")
+            if isinstance(image_val, (bytes, bytearray)):
+                raw = bytes(image_val)
+            elif isinstance(image_val, str):
+                raw = _b64.b64decode(image_val, validate=False)
+            else:
+                raise ValueError(f"unsupported image type: {type(image_val)}")
+            return Image.open(_io.BytesIO(raw)).convert("RGB")
+
+        def predict(self, context, model_input, params=None):
+            import torch as _torch
+            if isinstance(model_input, pd.DataFrame):
+                rows = model_input.to_dict(orient="records")
+            elif isinstance(model_input, dict):
+                rows = [model_input]
+            else:
+                rows = list(model_input)
+            results = []
+            for row in rows:
+                prompt = row.get("prompt") or self.default_prompt
+                img = self._row_to_image(row.get("image"))
+                messages = [{"role": "user", "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": prompt},
+                ]}]
+                inputs = self.processor.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=True,
+                    return_dict=True, return_tensors="pt",
+                ).to(self.model.device)
+                with _torch.no_grad():
+                    out_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=int(row.get("max_new_tokens") or self.max_new_tokens),
+                        do_sample=False,
+                    )
+                in_len = inputs["input_ids"].shape[-1]
+                text = self.processor.decode(out_ids[0, in_len:], skip_special_tokens=True)
+                results.append({"generated_text": text})
+            return pd.DataFrame(results)
+
+    # Build the cfg artifact dir with serve-time config (dtype, max_new_tokens, default_prompt).
+    cfg_dir = f"{OUTPUT_DIR}/cfg"
+    os.makedirs(cfg_dir, exist_ok=True)
+    with open(f"{cfg_dir}/serve_config.json", "w") as f:
+        json.dump({
+            "torch_dtype": "bfloat16",
+            "max_new_tokens": 400,
+            "default_prompt": TRAIN_PROMPT,
+        }, f)
+
+    # Pin pip requirements. Strip CUDA build tag from torch/torchvision.
     import torchvision as _tv
-    try:
-        import safetensors as _sft
-        sft_ver = _sft.__version__
-    except Exception:
-        sft_ver = None
-    try:
-        import tokenizers as _tk
-        tk_ver = _tk.__version__
-    except Exception:
-        tk_ver = None
-    # Strip the +cuXXX suffix on torch/torchvision to make the version a valid
-    # pip identifier (e.g. 2.7.1+cu118 → 2.7.1).
     torch_ver = torch.__version__.split('+')[0]
     tv_ver = _tv.__version__.split('+')[0]
     pip_reqs = [
         f"transformers=={transformers.__version__}",
         f"torch=={torch_ver}",
         f"torchvision=={tv_ver}",
-        "accelerate",
-        "peft",
+        "accelerate>=0.26.0",
         "qwen-vl-utils",
-        "Pillow",
+        "Pillow>=10.0.0",
     ]
-    if sft_ver:
-        pip_reqs.append(f"safetensors=={sft_ver}")
-    if tk_ver:
-        pip_reqs.append(f"tokenizers=={tk_ver}")
     print(f"[ft] pinning pip_requirements: {pip_reqs}")
-    # IMPORTANT: pass torch_dtype=torch.bfloat16 so the reloaded model uses
-    # bfloat16 at serve time. Without this, MLflow stores torch_dtype: null
-    # in MLmodel and the HF pipeline reloads in fp32, OOM'ing a 24 GB A10.
-    # The working pattern is also to pass a PATH (merged_dir) — not a dict —
-    # so MLflow's Pipeline-creation validation doesn't fight the multimodal
-    # Processor. We're already passing the path; we only needed to add dtype.
-    mlflow.transformers.log_model(
-        transformers_model=merged_dir,
+
+    # Build input_example + signature for Serving auto-schema.
+    # Use a 1x1 placeholder PNG so log_model can validate the signature without
+    # requiring an actual training frame on disk.
+    try:
+        from PIL import Image
+        import io as _io
+        _buf = _io.BytesIO()
+        Image.new("RGB", (1, 1)).save(_buf, format="PNG")
+        _ex_b64 = base64.b64encode(_buf.getvalue()).decode("ascii")
+    except Exception:
+        _ex_b64 = ""
+    import pandas as pd
+    input_example = pd.DataFrame([{"prompt": TRAIN_PROMPT, "image": _ex_b64}])
+    output_example = pd.DataFrame([{"generated_text": "{}"}])
+    signature = infer_signature(input_example, output_example)
+
+    print(f"[ft] logging + registering {UC_FULL} as mlflow.pyfunc")
+    mlflow.pyfunc.log_model(
         name="finetuned_model",
+        python_model=VLMPyfunc(),
+        artifacts={"model": merged_dir, "cfg": cfg_dir},
         registered_model_name=UC_FULL,
-        task="image-text-to-text",
-        torch_dtype=torch.bfloat16,
         signature=signature,
+        input_example=input_example,
+        pip_requirements=pip_reqs,
         metadata={
             "source_model": BASE_MODEL_DIR,
             "n_train_examples": len(train_rows),
             "train_loss": float(train_result.training_loss),
+            "default_prompt": TRAIN_PROMPT,
         },
-        pip_requirements=pip_reqs,
     )
     mlflow_url = f"{mlflow.get_tracking_uri()}#/experiments/{run.info.experiment_id}/runs/{training_run_id}"
     print(f"[ft] mlflow run url: {mlflow_url}")
