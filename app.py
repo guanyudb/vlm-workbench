@@ -1360,11 +1360,21 @@ def list_models(refresh: bool = False):
         if task != "llm/v1/chat":
             continue
         ready = e.get("state", {}).get("ready") == "READY"
-        # Prefer the explicit capability flag when the API returns it
+        # Prefer the explicit capability flag from endpoint metadata. The
+        # endpoint authoritatively knows; substring matching on the name
+        # mis-classifies new family members (e.g. `databricks-claude-fable-5`
+        # is text-only — sending it `[{type: image}, {type: text}]` content
+        # crashes the gateway's validator with "'list' object has no
+        # attribute 'strip'"). Only fall back to substring matching when
+        # the endpoint didn't report capabilities at all.
         caps = e.get("capabilities") or {}
-        vision = bool(caps.get("image_input")) or any(tag in name for tag in [
-            "claude", "gemini", "gpt-5", "gemma-3", "llama-4-maverick",
-        ])
+        if "image_input" in caps:
+            vision = bool(caps["image_input"])
+        else:
+            vision = any(tag in name for tag in [
+                "claude-opus", "claude-sonnet", "claude-haiku",
+                "gemini", "gpt-5", "gemma-3", "llama-4-maverick",
+            ])
         out.append(ModelEntry(name=name, task=task, ready=ready, vision=vision))
 
     out.sort(key=lambda m: ((not m.vision), (not m.ready), m.name))
@@ -1451,7 +1461,7 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
     client = _openai_client()
     t0 = time.time()
 
-    def _chat(send_temperature: bool) -> str:
+    def _chat(send_temperature: bool, send_response_format: bool = True) -> str:
         kwargs = dict(
             model=model_name,
             messages=[{
@@ -1465,6 +1475,13 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
         )
         if send_temperature:
             kwargs["temperature"] = temperature
+        # Force JSON-mode output so the per-cell parser doesn't hit "unparsed"
+        # when a model chooses prose. Every prompt template the workbench
+        # ships already requests strict JSON, so this just enforces what was
+        # asked. Endpoints that don't accept `response_format` get retried
+        # below without it.
+        if send_response_format:
+            kwargs["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
@@ -1473,12 +1490,27 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
             text = _chat(send_temperature=True)
         except Exception as e:
             msg = str(e)
+            # Endpoints that reject `response_format` (older Anthropic
+            # adapters in particular) → retry without it.
+            if "response_format" in msg.lower():
+                text = _chat(send_temperature=True, send_response_format=False)
             # Retry without temperature for reasoning models that reject it.
-            if "temperature" in msg.lower() and "does not support" in msg.lower():
+            elif "temperature" in msg.lower() and "does not support" in msg.lower():
                 text = _chat(send_temperature=False)
             # Retry via Responses API for endpoints that require it.
             elif "responses api" in msg.lower() or "/serving-endpoints/responses" in msg.lower():
                 text = _call_responses_api(client, model_name, frame_b64, prompt, max_tokens)
+            # Text-only endpoints (e.g. `databricks-claude-fable-5`) crash
+            # on multimodal content with `'list' object has no attribute
+            # 'strip'`. Surface a friendlier error so the user picks a
+            # vision-capable model instead of staring at a Python type
+            # error.
+            elif "'list' object has no attribute 'strip'" in msg:
+                raise RuntimeError(
+                    f"`{model_name}` doesn't accept image input — try a "
+                    f"vision-capable model (claude-opus / claude-sonnet / "
+                    f"gpt-5 / gemini / llama-4-maverick)."
+                )
             else:
                 raise
         return {
