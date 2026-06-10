@@ -158,6 +158,12 @@ export default function Playground({
   const [results, setResults] = usePersistentState<Map<string, RunResultRow>>(
     "vlmwb.pg.results", new Map(), mapStringCodec<RunResultRow>(),
   );
+  // Set of (model :: frame_basename) keys for cells we're actively calling
+  // right now. Drives the per-cell "calling…" spinner — including for
+  // cells that already have a prior result (so the user sees the cell
+  // transition during a Re-run, not stale data with no feedback).
+  // Intentionally NOT persisted — a fresh page load is never mid-call.
+  const [inFlight, setInFlight] = useState<Set<string>>(new Set());
   const [progress, setProgress] = usePersistentState<{ done: number; total: number } | null>(
     "vlmwb.pg.progress", null,
   );
@@ -401,11 +407,28 @@ export default function Playground({
                 }
                 return next;
               });
+              setInFlight((cur) => {
+                const next = new Set(cur);
+                for (const row of s.results!) {
+                  const base = (row.frame || "").split("/").pop() || row.frame;
+                  next.delete(`${r.modelName}::${base}`);
+                }
+                return next;
+              });
               setProgress((cur) => cur ? { ...cur, done: cur.done + s.results!.filter((x) => x.ok).length } : cur);
             }
             setLocalRuns((cur) => ({ ...cur, [r.modelName]: { ...cur[r.modelName], state: "succeeded", runPageUrl: s.run_page_url, finishedAt: Date.now() } }));
           } else if (s.life_cycle_state === "INTERNAL_ERROR" || s.life_cycle_state === "SKIPPED" ||
                      (s.life_cycle_state === "TERMINATED" && s.result_state !== "SUCCESS")) {
+            // Job failed — drop all cells for this model from in-flight so
+            // they fall back to either prior result or "—".
+            setInFlight((cur) => {
+              const next = new Set(cur);
+              for (const k of Array.from(next)) {
+                if (k.startsWith(`${r.modelName}::`)) next.delete(k);
+              }
+              return next;
+            });
             setLocalRuns((cur) => ({ ...cur, [r.modelName]: { ...cur[r.modelName], state: "failed", runPageUrl: s.run_page_url, error: s.state_message ?? "job failed", finishedAt: Date.now() } }));
           } else {
             setLocalRuns((cur) => ({ ...cur, [r.modelName]: { ...cur[r.modelName], runPageUrl: s.run_page_url } }));
@@ -570,6 +593,16 @@ export default function Playground({
     setRunError(null);
     setRunDuration(null);
     // Don't wipe localRuns either — let prior submissions retain their state.
+    // Build the in-flight cell set so each cell can render "calling…"
+    // regardless of whether it had a prior result.
+    const flightKeys = new Set<string>();
+    for (const [m, frames] of Object.entries(gatewayMissing)) {
+      for (const p of frames) flightKeys.add(`${m}::${p.split("/").pop() || p}`);
+    }
+    for (const [m, frames] of Object.entries(localMissing)) {
+      for (const p of frames) flightKeys.add(`${m}::${p.split("/").pop() || p}`);
+    }
+    setInFlight(flightKeys);
     const t0 = performance.now();
 
     // 1) AI Gateway — issue ONE call per model that has missing frames. The
@@ -593,6 +626,13 @@ export default function Playground({
               }
               return next;
             });
+            // Drop these cells from the in-flight set so their spinner
+            // resolves to the new ResultCell.
+            setInFlight((cur) => {
+              const next = new Set(cur);
+              for (const r of resp.results) next.delete(`${r.model}::${r.frame}`);
+              return next;
+            });
             setProgress((cur) => cur ? { ...cur, done: cur.done + resp.successful } : cur);
             setRunDuration(Number(((performance.now() - t0) / 1000).toFixed(2)));
             pendingGateway -= 1;
@@ -604,6 +644,15 @@ export default function Playground({
           },
           onError: (err) => {
             setRunError(err.message);
+            // Whole batch failed → clear in-flight for this model so the
+            // cells fall back from "calling…" to either prior result or "—".
+            setInFlight((cur) => {
+              const next = new Set(cur);
+              for (const p of framesForModel) {
+                next.delete(`${modelName}::${p.split("/").pop() || p}`);
+              }
+              return next;
+            });
             pendingGateway -= 1;
             if (pendingGateway === 0) cancelRef.current = null;
             const anyLocal = Object.values(localRuns).some((r) => r.state === "running" || r.state === "submitting");
@@ -657,6 +706,7 @@ export default function Playground({
     cancelRef.current?.();
     cancelRef.current = null;
     setRunning(false);
+    setInFlight(new Set());  // resolve all spinners back to prior result / —
   };
 
   // Union of AI Gateway + Local models that actually ran in this batch.
@@ -1126,6 +1176,7 @@ export default function Playground({
                 setProgress(null);
                 setRunDuration(null);
                 setLocalRuns({});
+                setInFlight(new Set());
               }}
               disabled={running || (results.size === 0 && Object.keys(localRuns).length === 0)}
               className="gap-2 text-muted-foreground"
@@ -1478,6 +1529,7 @@ export default function Playground({
                 labels={labels}
                 running={running}
                 gatewayModels={selectedModels}
+                inFlight={inFlight}
               />
             </CardContent>
           </Card>
@@ -1600,6 +1652,7 @@ function ResultsMatrix({
   labels,
   running,
   gatewayModels,
+  inFlight,
 }: {
   frames: string[];
   models: string[];
@@ -1607,11 +1660,14 @@ function ResultsMatrix({
   localRuns?: Record<string, { state: "submitting" | "running" | "succeeded" | "failed"; error?: string; runPageUrl?: string | null; startedAt: number }>;
   labels?: Map<string, FrameLabel>;
   // True while either an AI Gateway batch or a local-model job is in
-  // flight. We use it together with `gatewayModels` to detect cells that
-  // should show "calling…" (model is in the AI Gateway batch + has no
-  // result yet) vs cells that just haven't been run (show "—").
+  // flight. Kept around for the matrix's progress UI.
   running: boolean;
   gatewayModels: Set<string>;
+  // (model::frame_basename) keys that are actively being called RIGHT now.
+  // Drives the per-cell "calling…" spinner — including for cells that
+  // already had a result before the click (Re-run all visually flips them
+  // to spinner during the new call, then back to ResultCell on response).
+  inFlight: Set<string>;
 }) {
   // Per-model accuracy across frames that have a gold label. Only counts
   // frames where the model produced a parseable predicted class.
@@ -1719,36 +1775,31 @@ function ResultsMatrix({
                   </div>
                 </td>
                 {models.map((m) => {
-                  const r = results.get(`${m}::${fname}`);
+                  const key = `${m}::${fname}`;
+                  const r = results.get(key);
                   const local = localRuns?.[m];
-                  const localInFlight = local && (local.state === "running" || local.state === "submitting");
                   const localFailed = local && local.state === "failed";
-                  // AI Gateway in-flight: `running` is true AND this model
-                  // is in the AI Gateway batch (i.e. not a local-only
-                  // model). Without this branch a Run click on an AI
-                  // Gateway model that has no prior result would silently
-                  // sit on "—" until the response landed — looks like the
-                  // click did nothing.
-                  const gatewayInFlight = running && gatewayModels.has(m);
+                  const localInFlight = local && (local.state === "running" || local.state === "submitting");
+                  // Authoritative spinner signal: this cell is in the
+                  // current request batch. Wins over an older cached
+                  // result (so Re-run all visibly flips the cell to
+                  // spinner during the new call) and over the dash.
+                  const cellInFlight = inFlight.has(key) || localInFlight;
                   return (
                     <td key={m} className="w-72 min-w-56 max-w-72 border-l p-2 align-top">
-                      {r ? (
-                        <ResultCell row={r} goldLabel={gold} />
-                      ) : localInFlight ? (
+                      {cellInFlight ? (
                         <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                          <Loader2 className="size-3 animate-spin" /> waiting on GPU…
+                          <Loader2 className="size-3 animate-spin" />
+                          {localInFlight ? "waiting on GPU…" : "calling…"}
                         </div>
+                      ) : r ? (
+                        <ResultCell row={r} goldLabel={gold} />
                       ) : localFailed ? (
                         <div className="text-[11px] text-destructive" title={local.error}>job failed</div>
-                      ) : gatewayInFlight ? (
-                        <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                          <Loader2 className="size-3 animate-spin" /> calling…
-                        </div>
                       ) : (
                         // No result + nothing in flight → this cell was
-                        // never run (or its prior result fell out of the
-                        // persisted cache). Dash communicates "not run"
-                        // without implying any pending work.
+                        // never run. Dash communicates "not run" without
+                        // implying any pending work.
                         <span className="text-[11px] text-muted-foreground/60">—</span>
                       )}
                     </td>
