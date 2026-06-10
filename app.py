@@ -1543,9 +1543,15 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
             text = _chat(send_temperature=True)
         except Exception as e:
             msg = str(e)
-            # Endpoints that reject `response_format` (older Anthropic
-            # adapters in particular) → retry without it.
-            if "response_format" in msg.lower():
+            # Endpoints that reject `response_format` → retry without it.
+            # The gateway phrases this error two ways depending on
+            # adapter version:
+            #   • OpenAI-style: "response_format is not supported"
+            #   • Anthropic-style: "Response format type json_object is
+            #     not supported for this model." (fable-5 in particular)
+            # Match BOTH the underscored and space-separated forms.
+            if ("response_format" in msg.lower()
+                or "response format" in msg.lower()):
                 text = _chat(send_temperature=True, send_response_format=False)
             # Retry without temperature for reasoning models that reject it.
             elif "temperature" in msg.lower() and "does not support" in msg.lower():
