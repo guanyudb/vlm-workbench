@@ -118,11 +118,16 @@ export default function Compare() {
   const detailsReady = selectedDetails.length === selectedIds.size && selectedIds.size > 0;
 
   // Agreement metric: across each common frame, count distinct best-model predictions across snapshots
+  // NOTE: snapshot `results[].frame` is the frame BASENAME (the backend keys
+  // run results by basename), while `frame_paths` are full Volume paths —
+  // every resultIndex lookup must go through frameBasename() or it silently
+  // misses and the whole table renders dashes.
   const agreementStats = useMemo(() => {
     if (selectedDetails.length < 2 || commonFrames.length === 0) return null;
     let agree = 0;
     let total = 0;
-    commonFrames.forEach((f) => {
+    commonFrames.forEach((fullPath) => {
+      const f = frameBasename(fullPath);
       const labelsBySnap: string[] = selectedDetails.map((s) => {
         const best = s.best_model && s.best_model in (resultIndex[s.id]?.[f] || {})
           ? s.best_model
@@ -303,9 +308,12 @@ function FrameRow({
   snapshots: SnapshotDetail[];
   resultIndex: Record<string, Record<string, Record<string, RunResultRow>>>;
 }) {
-  // Per snapshot, gather (model, prediction) pairs
+  // Per snapshot, gather (model, prediction) pairs.
+  // resultIndex keys frames by BASENAME (matching the backend's result
+  // rows); framePath here is the full Volume path — normalize first.
+  const fkey = frameBasename(framePath);
   const perSnapshot = snapshots.map((s) => {
-    const byModel = resultIndex[s.id]?.[framePath] || {};
+    const byModel = resultIndex[s.id]?.[fkey] || {};
     return {
       snap: s,
       rows: s.model_names.map((m) => ({ model: m, row: byModel[m] })),
@@ -317,7 +325,7 @@ function FrameRow({
     const best = snap.best_model && rows.find((r) => r.model === snap.best_model)?.row
       ? snap.best_model
       : rows[0]?.model;
-    const r = best ? (resultIndex[snap.id]?.[framePath]?.[best]) : undefined;
+    const r = best ? (resultIndex[snap.id]?.[fkey]?.[best]) : undefined;
     return r?.parsed ? extractInstrument(r.parsed) : "";
   });
   const allBestPresent = bestLabels.every((l) => l);
