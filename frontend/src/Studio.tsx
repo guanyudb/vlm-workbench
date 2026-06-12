@@ -359,6 +359,20 @@ export default function Studio({
               {readAloud ? "Narrating" : "Narrate"}
             </Button>
           )}
+          {/* Browsers without speechSynthesis (or without the Google US
+              voices — Safari/Firefox) used to silently hide the Narrate
+              button, which read as a bug. Show a disabled hint instead. */}
+          {!ttsSupported && analysis && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled
+              className="gap-2 opacity-60"
+              title="Narration uses the browser's speech-synthesis voices, which aren't available in this browser. Chrome (desktop) has the best voices."
+            >
+              <VolumeX className="size-4" /> Narrate (unavailable)
+            </Button>
+          )}
 
           <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
             {analysis && (

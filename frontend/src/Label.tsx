@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, CheckCircle2, ChevronLeft, ChevronRight, Database, Loader2, RefreshCcw, Save, Trash2, Wand2, X } from "lucide-react";
+import { Check, CheckCircle2, ChevronLeft, ChevronRight, Database, Loader2, RefreshCcw, Save, Tag, Trash2, Wand2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -121,6 +121,44 @@ export default function LabelTab() {
     api.listSnapshots(40).then(setSnapshots).catch(() => {});
     refreshStats();
   }, []);
+
+  // Label-first path: stage frames straight from the extracted-frames
+  // source with blank drafts — no snapshot / model predictions required.
+  // Unblocks users who want ground truth before ever running a model.
+  const bootstrapFromFrames = async () => {
+    setBootstrapping(true);
+    setBootError(null);
+    try {
+      const frames = await api.frames({ source: "extracted" });
+      if (frames.length === 0) {
+        throw new Error("No extracted frames found — ingest a video in the Library tab first.");
+      }
+      const paths = frames.map((f) => f.path);
+      const existingArr = await api.listLabels(paths);
+      const existingByPath = new Map(existingArr.map((l) => [l.frame_path, l]));
+      const rows: StagedFrame[] = paths.map((path) => {
+        const existing = existingByPath.get(path) || null;
+        return {
+          frame_path: path,
+          predicted: { instrument: null, anatomy: null, tissue_condition: null, evidence: null, model: "(none — direct labeling)" },
+          existing,
+          draft: {
+            instrument: existing?.instrument ?? "",
+            anatomy: existing?.anatomy ?? "",
+            tissue_condition: existing?.tissue_condition ?? "",
+            notes: existing?.notes ?? "",
+          },
+          status: "pending",
+        };
+      });
+      setStaged(rows);
+      setIdx(0);
+    } catch (e) {
+      setBootError((e as Error).message);
+    } finally {
+      setBootstrapping(false);
+    }
+  };
 
   const bootstrap = async () => {
     if (!selectedSnapshotId) return;
@@ -328,9 +366,10 @@ export default function LabelTab() {
       {/* Bootstrap section */}
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Bootstrap from snapshot</CardTitle>
+          <CardTitle className="text-base">Stage frames to label</CardTitle>
           <CardDescription>
-            Pull predictions from a snapshot's best model. You'll verify each one before it lands.
+            Two paths: bootstrap from a snapshot (predictions pre-fill each draft, fastest when you've
+            already run models) — or label extracted frames directly with blank drafts.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -351,7 +390,12 @@ export default function LabelTab() {
             </div>
             <Button onClick={bootstrap} disabled={!selectedSnapshotId || bootstrapping} className="gap-2">
               {bootstrapping ? <Loader2 className="size-4 animate-spin" /> : <Wand2 className="size-4" />}
-              Stage labels
+              Stage from snapshot
+            </Button>
+            <Button onClick={bootstrapFromFrames} disabled={bootstrapping} variant="outline" className="gap-2"
+              title="Stage every extracted frame with a blank draft — no model predictions needed">
+              {bootstrapping ? <Loader2 className="size-4 animate-spin" /> : <Tag className="size-4" />}
+              Label frames directly
             </Button>
           </div>
           {bootError && <p className="text-xs text-destructive">{bootError}</p>}
@@ -371,6 +415,25 @@ export default function LabelTab() {
                 <Badge variant="default">{counts.saved} saved</Badge>
                 <Badge variant="outline">{counts.pending} pending</Badge>
                 <Badge variant="outline">{counts.skipped} skipped</Badge>
+                {/* Hotkey reference — the keyboard flow is the whole point
+                    of this tab but was undiscoverable before. */}
+                <div className="group relative">
+                  <button
+                    className="flex size-5 items-center justify-center rounded-full border text-[10px] text-muted-foreground hover:bg-accent"
+                    title="Keyboard shortcuts"
+                  >
+                    ?
+                  </button>
+                  <div className="invisible absolute right-0 top-7 z-30 w-64 rounded-md border bg-popover p-3 text-[11px] leading-relaxed shadow-md group-hover:visible">
+                    <p className="mb-1 font-medium">Keyboard shortcuts</p>
+                    <div className="grid grid-cols-[60px_1fr] gap-y-1 text-muted-foreground">
+                      <kbd className="font-mono">1–9</kbd><span>pick instrument class (order shown on the buttons)</span>
+                      <kbd className="font-mono">Enter</kbd><span>save &amp; advance</span>
+                      <kbd className="font-mono">→ / ←</kbd><span>next / previous frame</span>
+                      <kbd className="font-mono">s</kbd><span>skip frame</span>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </CardHeader>

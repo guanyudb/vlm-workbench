@@ -227,7 +227,11 @@ export default function Playground({
   // ── optimize ─────────────────────────────────────────────────────────
   const [optimizeOpen, setOptimizeOpen] = useState(false);
   const [optSnapshotId, setOptSnapshotId] = useState<string>("");
-  const [optTeacher, setOptTeacher] = useState<string>("databricks-claude-sonnet-4-5");
+  // Teacher defaults to Gold labels — supervised beats pseudo-labels
+  // whenever the user has labeled anything, and the snapshot-pin path
+  // (openOptimizeDialog) re-checks and falls back to a model teacher
+  // only when no gold labels exist for the chosen frames.
+  const [optTeacher, setOptTeacher] = useState<string>("__gold__");
   const [optStudent, setOptStudent] = useState<string>("databricks-claude-haiku-4-5");
   const [optType, setOptType] = useState<"gepa" | "dspy">("gepa");
   const [optRounds, setOptRounds] = useState<number>(5);
@@ -765,7 +769,14 @@ export default function Playground({
     try {
       const s = await api.getSnapshot(id);
       setSelectedFrames(new Set(s.frame_paths));
-      setSelectedModels(new Set(s.model_names));
+      // Partition the snapshot's models into AI Gateway vs local. Stuffing
+      // local model names into selectedModels would make the next Run
+      // issue an AI Gateway call with a local model name → per-frame
+      // errors. Local names are matched against the workbench's local
+      // model registry; everything else is assumed AI Gateway.
+      const localNames = new Set(localModels.map((m) => m.name));
+      setSelectedModels(new Set(s.model_names.filter((m) => !localNames.has(m))));
+      setSelectedLocalModels(new Set(s.model_names.filter((m) => localNames.has(m))));
       setPrompt(s.prompt);
       // Re-hydrate results so the matrix immediately shows what was saved
       const m = new Map<string, RunResultRow>();

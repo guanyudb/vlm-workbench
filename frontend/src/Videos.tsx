@@ -274,6 +274,7 @@ export default function Videos() {
                         {v.status_message}
                       </p>
                     )}
+                    {v.status === "ready" && <FramePreviewStrip videoName={v.name} />}
                   </div>
                   <div className="flex items-center gap-1.5">
                     {(v.status === "pending" || v.status === "error") && (
@@ -318,6 +319,44 @@ export default function Videos() {
           )}
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+// ── Per-video frame preview strip ────────────────────────────────────────
+//
+// Shows the first 4 extracted frames for a ready video so "ready · 44
+// frames" is visually verifiable without leaving the tab. Lazily fetched
+// per row; failures degrade to nothing (the badge row already communicates
+// the state).
+function FramePreviewStrip({ videoName }: { videoName: string }) {
+  const [paths, setPaths] = useState<string[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    // Strip the file extension — the extractor writes frames into a
+    // directory named after the video stem.
+    const stem = videoName.replace(/\.[^.]+$/, "");
+    api.frames({ source: "extracted", video: stem })
+      .then((frames) => {
+        if (!alive) return;
+        setPaths(frames.slice(0, 4).map((f) => f.path));
+      })
+      .catch(() => { if (alive) setPaths([]); });
+    return () => { alive = false; };
+  }, [videoName]);
+
+  if (!paths || paths.length === 0) return null;
+  return (
+    <div className="mt-2 flex gap-1.5">
+      {paths.map((p) => (
+        <img
+          key={p}
+          src={api.frameImageUrl(p)}
+          alt=""
+          loading="lazy"
+          className="h-12 w-12 rounded border object-cover"
+        />
+      ))}
     </div>
   );
 }

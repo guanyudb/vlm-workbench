@@ -119,14 +119,32 @@ export default function Deploy() {
     }
   };
 
-  const deleteEndpoint = async (name: string) => {
-    if (!confirm(`Tear down endpoint '${name}'? This stops serving immediately.`)) return;
+  // Styled confirm (was a native confirm() — inconsistent with the rest of
+  // the app's dialogs and unstyleable).
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
     try {
-      await api.deployDelete(name);
+      await api.deployDelete(deleteTarget);
+      setDeleteTarget(null);
       refresh();
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setDeleting(false);
     }
+  };
+
+  // Human-readable elapsed time since the endpoint last changed — gives
+  // the 15–30 min serving build a visible progress hint.
+  const elapsedSince = (ts: number | null): string | null => {
+    if (!ts) return null;
+    const mins = Math.floor((Date.now() - ts) / 60000);
+    if (mins < 1) return "<1m";
+    if (mins < 60) return `${mins}m`;
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`;
   };
 
   return (
@@ -242,6 +260,14 @@ export default function Deploy() {
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="truncate font-mono text-sm">{e.name}</span>
                       <StateBadge state={e.state} config_state={e.config_state} />
+                      {/* While building, show how long it's been — container
+                          builds for GPU serving routinely take 15–30 min and
+                          a bare spinner reads as "stuck". */}
+                      {(e.config_state === "IN_PROGRESS" || e.state === "NOT_READY") && elapsedSince(e.last_updated_timestamp) && (
+                        <span className="text-[11px] text-muted-foreground">
+                          building {elapsedSince(e.last_updated_timestamp)} · typical 15–30m
+                        </span>
+                      )}
                       {e.managed && (
                         <Badge variant="secondary" className="font-normal text-[10px]" title="Managed by this app">⚡ managed</Badge>
                       )}
@@ -272,7 +298,7 @@ export default function Deploy() {
                       <Button
                         size="sm"
                         variant="ghost"
-                        onClick={() => deleteEndpoint(e.name)}
+                        onClick={() => setDeleteTarget(e.name)}
                         className="gap-1 text-muted-foreground"
                         title="Tear down this endpoint"
                       >
@@ -298,6 +324,29 @@ export default function Deploy() {
           </p>
         </CardContent>
       </Card>
+
+      {/* Endpoint delete confirmation */}
+      <Dialog open={deleteTarget !== null} onOpenChange={(o) => !o && setDeleteTarget(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Tear down endpoint?</DialogTitle>
+            <DialogDescription>
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">{deleteTarget}</code> stops
+              serving immediately. Anything calling its URL will start failing. The underlying UC
+              model is untouched — you can redeploy it any time.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={confirmDelete} disabled={deleting} className="gap-2">
+              {deleting ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+              Tear down
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Deploy dialog */}
       <Dialog open={open} onOpenChange={setOpen}>
