@@ -4482,10 +4482,17 @@ def kick_off_ingest(req: IngestRequest):
             skipped.append({"name": name, "reason": f"yaml upload failed: {e}", "video_id": video_id})
             continue
 
-        # Serverless GPU (A10 + databricks_ai_v4): the v2 selector embeds
-        # candidates with DINOv2 — torch ships preinstalled in ai_v4, so this
-        # is both faster to start (no torch pip install) and gives the embed
-        # step a GPU. Same accelerator contract as the local-inference jobs.
+        # Serverless CPU (environment_version 5) — the proven ingest env.
+        # We tried GPU_1xA10 + databricks_ai_v4 (to give DINOv2 a GPU), but
+        # that serverless GPU env OOMs on this workspace/pool even at bare
+        # import of its own preinstalled torch/CUDA stack ("Compute became
+        # unresponsive. Compute is likely out of memory"), before any of our
+        # code runs. The notebook degrades gracefully on a torchless CPU env:
+        # it skips DINOv2 embeddings + phase segmentation (selector_version
+        # v1.5 — gate + coverage-floor + bookends, the decisive wins from the
+        # eval) and still writes the candidate sidecar for instant re-select.
+        # Re-enabling DINOv2 phases needs a GPU env that doesn't OOM (or a
+        # separate lightweight embed step) — tracked as a follow-up.
         body = {
             "run_name": f"vlmwb_ingest_{video_stem}",
             "tasks": [{
@@ -4495,14 +4502,14 @@ def kick_off_ingest(req: IngestRequest):
                     "source": "WORKSPACE",
                     "base_parameters": {"config_yaml": yaml_path},
                 },
-                "environment_key": "gpu_env",
-                "compute": {"hardware_accelerator": "GPU_1xA10"},
+                "environment_key": "cpu_env",
             }],
             "queue": {"enabled": True},
             "environments": [{
-                "environment_key": "gpu_env",
-                "spec": {"base_environment": "databricks_ai_v4"},
+                "environment_key": "cpu_env",
+                "spec": {"environment_version": "5"},
             }],
+            "performance_target": "PERFORMANCE_OPTIMIZED",
         }
         try:
             resp = w.api_client.do("POST", "/api/2.1/jobs/runs/submit", body=body)
