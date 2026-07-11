@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Smart frame extraction (ingest) — selector v1.5
+# MAGIC # Smart frame extraction (ingest) — selector v2
 # MAGIC
 # MAGIC Reads a YAML config (passed via the `config_yaml` widget):
 # MAGIC
@@ -14,35 +14,38 @@
 # MAGIC pg_user: <sp uuid or user email>
 # MAGIC candidate_fps: 1.0
 # MAGIC max_frames: 40
+# MAGIC max_gap_seconds: null   # optional; default clamp(2*dur/max_frames, 10, 60)
 # MAGIC ```
 # MAGIC
-# MAGIC ## v1.5 (gate v2) — what changed vs v1
+# MAGIC ## Pipeline (validated on 4 videos — see repo-parent `frame_selection_experiment/`)
 # MAGIC
-# MAGIC v1 scored every candidate on sharpness+colorfulness+contrast and picked the
-# MAGIC best per time window. Validated on 4 videos (2 arthroscopy, 2 laparoscopy;
-# MAGIC see `frame_selection_experiment/` in the repo parent), that approach:
-# MAGIC   - wasted ~22% of picks on defocused "blank disc" frames (Laplacian
-# MAGIC     sharpness *rewards* sensor noise on blank frames),
-# MAGIC   - rewarded blood/glare via the colorfulness term.
+# MAGIC 1. **Candidates** at `candidate_fps` (decord decode, cv2 signals).
+# MAGIC 2. **Domain gate** (model-free): per-video scope mask → blurred-gradient
+# MAGIC    focus signal → drop blank / glare / red-out / scope-out / bad-exposure /
+# MAGIC    **out-of-body** (bright border ⇒ scope withdrawn into the room; PHI
+# MAGIC    guard — such frames are never written to the Volume).
+# MAGIC 3. **DINOv2 embeddings** (ViT-S/14, weights cached on the Volume) →
+# MAGIC    **phase segmentation** via embedding change-points — the surgical
+# MAGIC    narrative (tool in → tool out → altered scene → next tool).
+# MAGIC 4. **hybrid_coverage selection**: coverage anchors (≥1 frame per
+# MAGIC    `max_gap_seconds`) + bookends (first/last usable frame) + best-value
+# MAGIC    fill (0.6·grad + 0.4·contrast ranks − 0.5·glare).
+# MAGIC 5. **Micro-alignment**: each pick is re-scanned ±0.5 s at native fps and
+# MAGIC    replaced when a ≥3 % sharper neighbour exists (mp4/mov only).
+# MAGIC 6. **Persist everything**: ALL gated candidates (JPG ≤1024 px +
+# MAGIC    `candidates.json` sidecar + `embeddings.npz`) land in
+# MAGIC    `<output_dir>/candidates/`; index rows carry `selected` flags so the
+# MAGIC    app can re-select (new K / Y) instantly without re-running this job.
 # MAGIC
-# MAGIC v1.5 adds a **model-free domain gate** before selection:
-# MAGIC   1. per-video scope mask (endoscope circle; full-frame fallback when the
-# MAGIC      video has no vignette) — all stats are computed inside the mask;
-# MAGIC   2. blurred-gradient focus signal (Gaussian σ=2 → Sobel; real edges
-# MAGIC      survive the blur, noise doesn't — unlike Laplacian);
-# MAGIC   3. drops: blank (grad < 0.55×video median), glare (>35% blown pixels),
-# MAGIC      red-out (lens against blood: >85% saturated-red), scope-out
-# MAGIC      (>60% black), bad exposure, and **out-of-body** (bright content in
-# MAGIC      the normally-black border → scope withdrawn into the room; PHI
-# MAGIC      guard — these frames are never written to the Volume);
-# MAGIC   4. scoring drops colorfulness: 0.6×grad_rank + 0.4×contrast_rank;
-# MAGIC   5. bookend rule: the first and last *gated* candidates are always
-# MAGIC      included (set-level judging showed every selector missed the
-# MAGIC      entry / final-state story beats).
+# MAGIC If torch/DINOv2 is unavailable the notebook degrades to the gated
+# MAGIC quality+coverage selector (v1.5 behavior) and says so in the status.
 
 # COMMAND ----------
 # MAGIC %pip install -q --upgrade decord pillow numpy opencv-python-headless psycopg[binary] pyyaml
 # MAGIC %restart_python
+# NOTE: torch is NOT pip-installed — the app submits this notebook on
+# serverless GPU (GPU_1xA10 + base_environment=databricks_ai_v4) where torch
+# ships preinstalled. On a CPU environment the DINOv2 stage cleanly degrades.
 
 # COMMAND ----------
 import os, json, time, math, traceback
@@ -69,23 +72,21 @@ PG_USER = cfg["pg_user"]
 PG_PORT = int(cfg.get("pg_port", 5432))
 CANDIDATE_FPS = float(cfg.get("candidate_fps", 1.0))
 MAX_FRAMES = int(cfg.get("max_frames", 40))
-SELECTOR_VERSION = "v1.5"
-# Lakebase endpoint path — the notebook mints its OWN Postgres token via
-# /api/2.0/postgres/credentials as the run identity (the App SP). We never
-# accept a pre-minted password: it would leak via the Volume-stored YAML.
+MAX_GAP_S = cfg.get("max_gap_seconds")  # None → computed from duration below
 PG_ENDPOINT = cfg.get("pg_endpoint", "")
-PG_INSTANCE = cfg.get("pg_instance", "")  # legacy Provisioned fallback
+PG_INSTANCE = cfg.get("pg_instance", "")
 
+CAND_DIR = f"{OUTPUT_DIR}/candidates"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-# Clear frames from a prior ingest so re-running doesn't accumulate stale picks.
+os.makedirs(CAND_DIR, exist_ok=True)
 import glob as _glob
-for _stale in _glob.glob(f"{OUTPUT_DIR}/*.jpg"):
+for _stale in _glob.glob(f"{OUTPUT_DIR}/*.jpg") + _glob.glob(f"{CAND_DIR}/*.jpg"):
     try:
         os.remove(_stale)
     except Exception:
         pass
-print(f"[ingest] video={VIDEO_NAME} video_id={VIDEO_ID} selector={SELECTOR_VERSION}")
-print(f"[ingest] output={OUTPUT_DIR}  candidate_fps={CANDIDATE_FPS}  max_frames={MAX_FRAMES}")
+print(f"[ingest] video={VIDEO_NAME} video_id={VIDEO_ID}")
+print(f"[ingest] output={OUTPUT_DIR}  candidate_fps={CANDIDATE_FPS}  max_frames={MAX_FRAMES}  max_gap={MAX_GAP_S}")
 
 # COMMAND ----------
 from databricks.sdk import WorkspaceClient
@@ -140,16 +141,15 @@ def _set_video_status(status: str, message: str = "", duration_s: float = None, 
 _set_video_status("processing", "loading video")
 
 # COMMAND ----------
-# Signals. cv2 for speed (the v1 numpy sliding-window Laplacian was the slow
-# path); decord stays the decoder.
 import cv2
 from decord import VideoReader, cpu
 
-MAX_SIDE = 640  # analysis resolution; picks are re-read at full res for saving
+MAX_SIDE = 640    # analysis resolution
+SAVE_SIDE = 1024  # persisted candidate JPG resolution (Playground resizes to 1024 anyway)
 
-def _small(rgb):
+def _resize_max(rgb, max_side):
     h, w = rgb.shape[:2]
-    s = MAX_SIDE / max(h, w)
+    s = max_side / max(h, w)
     if s < 1:
         rgb = cv2.resize(rgb, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
     return rgb
@@ -160,6 +160,12 @@ def _rank(values):
     n = len(v)
     return order / (n - 1) if n > 1 else np.full(n, 0.5)
 
+def _grad_of(gray, m_bool):
+    gb = cv2.GaussianBlur(gray, (0, 0), 2.0)
+    gx = cv2.Sobel(gb, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(gb, cv2.CV_32F, 0, 1)
+    return float(np.sqrt(gx ** 2 + gy ** 2)[m_bool].mean())
+
 # COMMAND ----------
 try:
     t0 = time.time()
@@ -169,15 +175,17 @@ try:
     duration_s = n_total / max(fps, 0.001)
     step = max(1, int(fps / CANDIDATE_FPS))
     indices = list(range(0, n_total, step))
+    if MAX_GAP_S is None:
+        MAX_GAP_S = float(np.clip(2.0 * duration_s / max(MAX_FRAMES, 1), 10.0, 60.0))
     print(f"[ingest] {n_total} frames @ {fps:.1f}fps = {duration_s:.1f}s; "
-          f"scoring {len(indices)} candidates (1 per {step} frames)")
+          f"{len(indices)} candidates; max_gap={MAX_GAP_S:.0f}s")
     _set_video_status("processing", f"{n_total} frames @ {fps:.1f}fps", duration_s=duration_s)
 
-    # ---- pass A: grays only (memory-safe for long videos) → scope mask ----
+    # ---- pass A: grays only → scope mask (memory-flat on long videos) ----
     grays, ok_idx = [], []
     for idx in indices:
         try:
-            rgb = _small(vr[idx].asnumpy())
+            rgb = _resize_max(vr[idx].asnumpy(), MAX_SIDE)
         except Exception:
             continue
         grays.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
@@ -186,9 +194,6 @@ try:
         raise RuntimeError("no decodable candidate frames")
     Hs, Ws = grays[0].shape
 
-    # Scope mask: endoscope footage is a bright circle on a black vignette
-    # (~67% of every arthroscopy frame is border). Whole-frame stats are
-    # meaningless there — everything below is computed inside this mask.
     mask = (np.max(np.stack(grays), axis=0) > 25).astype(np.uint8)
     ncc, lab = cv2.connectedComponents(mask)
     if ncc > 1:
@@ -196,7 +201,7 @@ try:
         mask = (lab == biggest).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     mask = cv2.erode(mask, np.ones((21, 21), np.uint8))
-    full_frame = mask.mean() > 0.90  # no vignette (e.g. laparoscopy) → whole frame
+    full_frame = mask.mean() > 0.90
     if full_frame:
         mask = np.ones((Hs, Ws), np.uint8)
     M = mask.astype(bool)
@@ -204,22 +209,17 @@ try:
     print(f"[ingest] scope mask covers {M.mean()*100:.0f}% "
           f"({'full-frame fallback' if full_frame else 'circle'})")
 
-    # ---- pass B: re-decode, compute in-mask signals per candidate ----
+    # ---- pass B: signals per candidate ----
     candidates = []
     for gi, idx in enumerate(ok_idx):
         try:
-            rgb = _small(vr[idx].asnumpy())
+            rgb = _resize_max(vr[idx].asnumpy(), MAX_SIDE)
         except Exception:
             continue
         g = grays[gi]
-        gb = cv2.GaussianBlur(g, (0, 0), 2.0)
-        gx = cv2.Sobel(gb, cv2.CV_32F, 1, 0)
-        gy = cv2.Sobel(gb, cv2.CV_32F, 0, 1)
-        grad = float(np.sqrt(gx ** 2 + gy ** 2)[M].mean())
         v = g[M]
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hch, sch = hsv[..., 0][M], hsv[..., 1][M]
-        # legacy columns, kept for continuity in the index/UI
         sharp = float(cv2.Laplacian(g, cv2.CV_64F).var())
         r_, g_, b_ = (rgb[..., i].astype(np.float32) for i in (0, 1, 2))
         rg = r_ - g_
@@ -228,7 +228,7 @@ try:
         candidates.append({
             "frame_index": int(idx),
             "timestamp_s": float(idx / fps),
-            "grad": grad,
+            "grad": _grad_of(g, M),
             "contrast": float(v.std()),
             "sharpness": sharp,
             "colorfulness": float(colorf),
@@ -263,55 +263,180 @@ try:
     drops = Counter(c["gate_reason"] for c in candidates if c["gate_reason"] != "ok")
     drop_str = ", ".join(f"{k} {v}" for k, v in sorted(drops.items())) or "none"
     print(f"[ingest] gate: {len(gated)}/{len(candidates)} pass "
-          f"(dropped: {drop_str}; grad_med={grad_med:.1f}, border_base={border_base:.1f})")
+          f"(dropped: {drop_str}; grad_med={grad_med:.1f})")
     if not gated:
         raise RuntimeError(f"domain gate rejected all {len(candidates)} candidates ({drop_str})")
 
-    # ---- score + select: bookends first, then best-per-window ----
+    # ---- DINOv2 embeddings + phase segmentation (degrades gracefully) ----
+    selector_version = "v2"
+    embs = None
+    try:
+        # Cache hub weights on the Volume so they download exactly once per
+        # workspace. Derive <volume-root>/local_models/torch_hub from the
+        # output dir (…/medical_video/extracted_frames/<stem>).
+        vol_root = os.path.dirname(os.path.dirname(OUTPUT_DIR))
+        os.environ["TORCH_HOME"] = f"{vol_root}/local_models/torch_hub"
+        os.makedirs(os.environ["TORCH_HOME"], exist_ok=True)
+        import torch
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", verbose=False).eval().to(dev)
+        MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dev)
+        STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dev)
+        t_e = time.time()
+        chunks = []
+        B = 32
+        for j in range(0, len(gated), B):
+            batch = []
+            for c in gated[j:j + B]:
+                rgb = _resize_max(vr[c["frame_index"]].asnumpy(), MAX_SIDE)
+                im = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+                batch.append(torch.from_numpy(im).permute(2, 0, 1))
+            x = torch.stack(batch).to(dev)
+            with torch.no_grad():
+                chunks.append(dino((x - MEAN) / STD).float().cpu().numpy())
+        embs = np.concatenate(chunks, 0)
+        embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8)
+        print(f"[ingest] DINOv2: embedded {len(gated)} candidates on {dev} in {time.time()-t_e:.0f}s")
+    except Exception as e:
+        selector_version = "v1.5"
+        print(f"[ingest][warn] DINOv2 unavailable → falling back to {selector_version}: {str(e)[:200]}")
+
+    n_phases = int(np.clip(MAX_FRAMES, 4, 24))
+    if embs is not None and len(gated) > n_phases:
+        # Change-point segmentation: split at the largest embedding-novelty
+        # jumps (min-gap enforced) → contiguous narrative phases.
+        nov = np.array([0.0] + [1 - float(np.dot(embs[i], embs[i - 1])) for i in range(1, len(gated))])
+        nov = np.convolve(nov, np.ones(3) / 3, mode="same")
+        min_gap = max(1, len(gated) // (n_phases * 2))
+        bounds = []
+        for ci in np.argsort(-nov):
+            if ci == 0:
+                continue
+            if all(abs(int(ci) - b) >= min_gap for b in bounds):
+                bounds.append(int(ci))
+            if len(bounds) >= n_phases - 1:
+                break
+        bounds = sorted(bounds)
+        pid = 0
+        for i, c in enumerate(gated):
+            if bounds and i >= bounds[0]:
+                bounds.pop(0)
+                pid += 1
+            c["phase_id"] = pid
+    else:
+        # fallback: equal-duration phases
+        for c in gated:
+            c["phase_id"] = min(n_phases - 1, int(c["timestamp_s"] / max(duration_s, 1e-6) * n_phases))
+
+    # ---- value + hybrid_coverage selection ----
     g_rank = _rank([c["grad"] for c in gated])
     c_rank = _rank([c["contrast"] for c in gated])
     for c, a, b in zip(gated, g_rank, c_rank):
-        c["score"] = 0.6 * a + 0.4 * b
+        c["value"] = 0.6 * a + 0.4 * b - 0.5 * c["whiteout"]
 
-    window_s = max(2.0, duration_s / MAX_FRAMES) if duration_s > 0 else 2.0
-    by_time = sorted(gated, key=lambda x: x["timestamp_s"])
-    selected = []
-    # Bookends: guarantee the entry moment + final state are represented.
-    selected.append(by_time[0])
-    if len(by_time) > 1 and by_time[-1]["timestamp_s"] - by_time[0]["timestamp_s"] >= 1.0:
-        selected.append(by_time[-1])
-    for c in sorted(gated, key=lambda x: -x["score"]):
-        if len(selected) >= MAX_FRAMES:
-            break
-        if any(abs(c["timestamp_s"] - s["timestamp_s"]) < window_s for s in selected):
-            continue
-        selected.append(c)
-    selected.sort(key=lambda x: x["timestamp_s"])
-    print(f"[ingest] selected {len(selected)} frames "
-          f"(window={window_s:.2f}s, incl. bookends at "
-          f"{selected[0]['timestamp_s']:.1f}s / {selected[-1]['timestamp_s']:.1f}s)")
+    # NOTE: keep in sync with `_hybrid_coverage_select` in app.py (reselect
+    # endpoint) — same algorithm, duplicated because notebooks are imported
+    # into the SP home as single files and can't share a module with the app.
+    def _select(pool, k, y, dur):
+        pool = sorted(pool, key=lambda c: c["timestamp_s"])
+        n_min = max(1, math.ceil(dur / y))
+        picked, anchor_keys = [], set()
+        for i in range(n_min):                      # coverage anchors
+            w0, w1 = i * y, min((i + 1) * y, dur + 1e-6)
+            inwin = [c for c in pool if w0 <= c["timestamp_s"] < w1]
+            if inwin:
+                best = max(inwin, key=lambda c: c["value"])
+                if best not in picked:
+                    picked.append(best)
+                    anchor_keys.add(best["timestamp_s"])
+        for bk in (pool[0], pool[-1]):              # bookends
+            if bk not in picked and len(picked) < max(k, n_min):
+                picked.append(bk)
+        remaining = sorted([c for c in pool if c not in picked], key=lambda c: -c["value"])
+        keff = min(max(k, n_min), len(pool))
+        for min_gap in (0.5 * y, 0.33 * y, 0.2 * y, 0.0):   # value fill, relaxing spacing
+            for c in remaining:
+                if len(picked) >= keff:
+                    break
+                if c in picked:
+                    continue
+                if all(abs(c["timestamp_s"] - p["timestamp_s"]) >= min_gap for p in picked):
+                    picked.append(c)
+            if len(picked) >= keff:
+                break
+        picked.sort(key=lambda c: c["timestamp_s"])
+        return picked, anchor_keys
 
-    # ---- write picks (full-res) + register in Lakebase ----
-    # (note: no `# COMMAND ----------` inside try — Databricks would split the
-    # cell and break the try/except across cells)
+    selected, anchor_keys = _select(gated, MAX_FRAMES, MAX_GAP_S, duration_s)
+    sel_keys = {c["timestamp_s"] for c in selected}
+    gaps = np.diff([0.0] + sorted(sel_keys) + [duration_s])
+    print(f"[ingest] selected {len(selected)}/{len(gated)} (max_gap={gaps.max():.1f}s, "
+          f"{len(anchor_keys)} anchors, phases hit "
+          f"{len({c['phase_id'] for c in selected})}/{max(c['phase_id'] for c in gated)+1})")
+
+    # ---- micro-alignment (mp4/mov only; accept only ≥3% sharper) ----
+    refined_n = 0
+    if Path(VIDEO_PATH).suffix.lower() in (".mp4", ".mov", ".m4v"):
+        half = int(round(fps * 0.5))
+        for c in selected:
+            lo = max(0, c["frame_index"] - half)
+            hi = min(n_total - 1, c["frame_index"] + half)
+            best_g, best_idx = c["grad"], c["frame_index"]
+            for fi in range(lo, hi + 1, max(1, (hi - lo) // 14)):  # ~15 probes
+                if fi == c["frame_index"]:
+                    continue
+                try:
+                    g2 = cv2.cvtColor(_resize_max(vr[fi].asnumpy(), MAX_SIDE), cv2.COLOR_RGB2GRAY)
+                except Exception:
+                    continue
+                if g2.shape != (Hs, Ws):
+                    continue
+                gv = _grad_of(g2, M)
+                if gv > best_g:
+                    best_g, best_idx = gv, fi
+            if best_idx != c["frame_index"] and best_g >= 1.03 * c["grad"]:
+                c["frame_index"], c["grad"] = best_idx, best_g
+                c["timestamp_s"] = best_idx / fps
+                refined_n += 1
+        print(f"[ingest] micro-align: refined {refined_n}/{len(selected)} picks")
+        sel_keys = {c["timestamp_s"] for c in selected}
+
+    # ---- persist candidates + sidecar + register in Lakebase ----
+    # (no `# COMMAND ----------` inside try — Databricks would split the cell)
     video_stem = Path(VIDEO_NAME).stem
-    frame_rows = []
-    for c in selected:
-        ts = c["timestamp_s"]
-        filename = f"{video_stem}_frame_{ts:07.2f}s.jpg"
-        out_path = f"{OUTPUT_DIR}/{filename}"
-        Image.fromarray(vr[c["frame_index"]].asnumpy()).save(out_path, format="JPEG", quality=92)
-        frame_rows.append({**c, "frame_path": out_path, "frame_name": filename})
+    rows = []
+    for c in gated:
+        is_sel = c["timestamp_s"] in sel_keys
+        filename = f"{video_stem}_frame_{c['timestamp_s']:07.2f}s.jpg"
+        out_path = f"{CAND_DIR}/{filename}"
+        Image.fromarray(_resize_max(vr[c["frame_index"]].asnumpy(), SAVE_SIDE)).save(
+            out_path, format="JPEG", quality=88)
+        rows.append({**c, "frame_path": out_path, "frame_name": filename,
+                     "selected": is_sel,
+                     "is_anchor": c["timestamp_s"] in anchor_keys})
+
+    sidecar = {
+        "video_id": VIDEO_ID, "video_name": VIDEO_NAME, "duration_s": duration_s,
+        "selector_version": selector_version, "max_frames": MAX_FRAMES,
+        "max_gap_seconds": MAX_GAP_S, "gate_drops": dict(drops),
+        "candidates": [{k: v for k, v in r.items() if k != "frame_index"} for r in rows],
+    }
+    with open(f"{OUTPUT_DIR}/candidates.json", "w") as f:
+        json.dump(sidecar, f)
+    if embs is not None:
+        np.savez(f"{OUTPUT_DIR}/embeddings.npz", embs=embs,
+                 timestamps=np.array([c["timestamp_s"] for c in gated]))
+    print(f"[ingest] persisted {len(rows)} candidates + sidecar to {OUTPUT_DIR}")
 
     with _conn() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM extracted_frames_index WHERE video_id = %s", (VIDEO_ID,))
-        for r in frame_rows:
+        for r in rows:
             cur.execute("""
                 INSERT INTO extracted_frames_index
                     (video_id, frame_path, frame_name, timestamp_s, score,
                      sharpness, colorfulness, contrast, grad,
-                     selected, selector_version)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s)
+                     phase_id, is_anchor, selected, selector_version)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (frame_path) DO UPDATE SET
                     video_id = EXCLUDED.video_id,
                     timestamp_s = EXCLUDED.timestamp_s,
@@ -320,29 +445,35 @@ try:
                     colorfulness = EXCLUDED.colorfulness,
                     contrast = EXCLUDED.contrast,
                     grad = EXCLUDED.grad,
-                    selected = true,
+                    phase_id = EXCLUDED.phase_id,
+                    is_anchor = EXCLUDED.is_anchor,
+                    selected = EXCLUDED.selected,
                     selector_version = EXCLUDED.selector_version,
                     updated_at = now()
             """, (
                 VIDEO_ID, r["frame_path"], r["frame_name"], r["timestamp_s"],
-                r["score"], r["sharpness"], r["colorfulness"], r["contrast"],
-                r["grad"], SELECTOR_VERSION,
+                r["value"], r["sharpness"], r["colorfulness"], r["contrast"],
+                r["grad"], r["phase_id"], r["is_anchor"], r["selected"],
+                selector_version,
             ))
-    print(f"[ingest][db] registered {len(frame_rows)} frames")
+    n_sel = sum(1 for r in rows if r["selected"])
+    print(f"[ingest][db] registered {len(rows)} candidates ({n_sel} selected)")
 
     elapsed = time.time() - t0
     _set_video_status(
         "ready",
-        f"extracted {len(frame_rows)} frames in {elapsed:.0f}s · "
-        f"gated {len(gated)}/{len(candidates)} candidates (dropped: {drop_str})",
-        n_frames=len(frame_rows),
+        f"selected {n_sel} of {len(rows)} candidates ({selector_version}) in {elapsed:.0f}s · "
+        f"dropped: {drop_str} · re-select available",
+        n_frames=n_sel,
     )
     _exit_payload = json.dumps({
         "video_id": VIDEO_ID,
-        "n_frames": len(frame_rows),
-        "n_candidates": len(candidates),
+        "n_frames": n_sel,
+        "n_candidates": len(rows),
         "gate_drops": dict(drops),
-        "selector_version": SELECTOR_VERSION,
+        "selector_version": selector_version,
+        "max_gap_seconds": MAX_GAP_S,
+        "micro_aligned": refined_n,
         "elapsed_s": elapsed,
         "status": "ready",
     })

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  AlertCircle, CheckCircle2, Clock, ImageIcon, Loader2, Play, RefreshCcw, Trash2, Upload, Video, XCircle,
+  AlertCircle, CheckCircle2, Clock, ImageIcon, Loader2, Play, RefreshCcw, Trash2, Upload, Video, Wand2, XCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -48,6 +48,12 @@ export default function Videos() {
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [candidateFps, setCandidateFps] = useState<number>(1.0);
   const [maxFrames, setMaxFrames] = useState<number>(40);
+  // Coverage floor (v2 selector): guarantee >=1 frame per this many seconds.
+  // 0/empty = auto (2·duration/max_frames, clamped 10–60s).
+  const [maxGapS, setMaxGapS] = useState<number>(0);
+  // Per-row reselect state: video_id currently reselecting + status text
+  const [reselecting, setReselecting] = useState<string | null>(null);
+  const [reselectNote, setReselectNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [volumePath, setVolumePath] = useState<string>(FALLBACK_VOLUME);
   const videosInboxPath = `${volumePath}/videos/inbox/`;
@@ -91,6 +97,7 @@ export default function Videos() {
           video_name: row.name,
           candidate_fps: candidateFps,
           max_frames: maxFrames,
+          max_gap_seconds: maxGapS > 0 ? maxGapS : undefined,
           force,
         });
         if (r.skipped.length > 0 && r.submitted.length === 0) {
@@ -117,6 +124,7 @@ export default function Videos() {
         const r = await api.ingestSubmit({
           candidate_fps: candidateFps,
           max_frames: maxFrames,
+          max_gap_seconds: maxGapS > 0 ? maxGapS : undefined,
         });
         if (r.submitted.length > 0) submittedAny = true;
         if (r.submitted.length === 0 && r.skipped.length > 0) {
@@ -145,6 +153,28 @@ export default function Videos() {
       refresh();
     } catch (e) {
       setError((e as Error).message);
+    }
+  };
+
+  // Instant re-selection over the persisted v2 candidate pool (no GPU job).
+  // 409 means the video predates the v2 selector → needs one re-ingest first.
+  const reselectOne = async (video_id: string) => {
+    setReselecting(video_id);
+    setReselectNote(null);
+    setError(null);
+    try {
+      const r = await api.reselectFrames(video_id, {
+        max_frames: maxFrames,
+        max_gap_seconds: maxGapS > 0 ? maxGapS : undefined,
+      });
+      setReselectNote(
+        `re-selected ${r.n_selected}/${r.n_candidates} candidates · max gap ${r.max_gap_s}s`
+      );
+      refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setReselecting(null);
     }
   };
 
@@ -221,14 +251,34 @@ export default function Videos() {
                 className="w-28"
               />
             </div>
+            <div>
+              <Label className="text-xs">Max gap (s, 0 = auto)</Label>
+              <Input
+                type="number"
+                min={0}
+                max={120}
+                step={5}
+                value={maxGapS}
+                onChange={(e) => setMaxGapS(Number(e.target.value) || 0)}
+                className="w-28"
+                title="Coverage floor: guarantee at least one selected frame every N seconds so the timeline has no blind spots. 0 = auto (2×duration/max frames, clamped 10–60s)."
+              />
+            </div>
             <p className="text-[10px] text-muted-foreground">
-              Default 1 fps × 40 frames is a good starting point for arthroscopy videos. Increase
-              max_frames for longer videos.
+              Default 1 fps × 40 frames works well for arthroscopy. The gap floor guarantees
+              timeline coverage; frames beyond the floor go to the most informative moments.
+              These knobs also drive per-video <span className="font-medium">Re-select</span>{" "}
+              (instant, no GPU job).
             </p>
           </div>
           {error && (
             <p className="mt-3 flex items-center gap-1 text-xs text-destructive">
               <AlertCircle className="size-3.5" /> {error}
+            </p>
+          )}
+          {reselectNote && (
+            <p className="mt-3 flex items-center gap-1 text-xs text-muted-foreground">
+              <CheckCircle2 className="size-3.5 text-emerald-500" /> {reselectNote}
             </p>
           )}
         </CardContent>
@@ -287,6 +337,20 @@ export default function Videos() {
                       >
                         {submitting === v.name ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
                         {v.status === "error" ? "Retry" : "Ingest"}
+                      </Button>
+                    )}
+                    {v.status === "ready" && v.kind !== "image_batch" && v.id && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={reselecting === v.id}
+                        onClick={() => reselectOne(v.id!)}
+                        className="gap-1"
+                        title="Instantly re-pick frames from the stored candidate pool using the knobs above — no GPU job. Videos ingested before the v2 selector need one Re-ingest first."
+                      >
+                        {reselecting === v.id
+                          ? <Loader2 className="size-3.5 animate-spin" />
+                          : <Wand2 className="size-3.5" />} Re-select
                       </Button>
                     )}
                     {v.status === "ready" && (

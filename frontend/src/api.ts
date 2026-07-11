@@ -568,12 +568,27 @@ export const api = {
   ingestVideos: () =>
     fetch("/api/ingest/videos").then(asJson<{ videos: IngestVideoRow[] }>),
 
-  ingestSubmit: (body: { video_name?: string; candidate_fps?: number; max_frames?: number; force?: boolean }) =>
+  ingestSubmit: (body: { video_name?: string; candidate_fps?: number; max_frames?: number; max_gap_seconds?: number; force?: boolean }) =>
     fetch("/api/videos/ingest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then(asJson<{ submitted: { name: string; video_id: string; databricks_run_id: string }[]; skipped: { name: string; reason: string }[] }>),
+
+  // v2 selector only: instant re-selection over the persisted candidate pool
+  // (no GPU job). 409 = video was ingested pre-v2, needs one re-ingest.
+  reselectFrames: (video_id: string, body: { max_frames?: number; max_gap_seconds?: number }) =>
+    fetch(`/api/videos/${encodeURIComponent(video_id)}/reselect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(asJson<{
+      video_id: string;
+      n_selected: number;
+      n_candidates: number;
+      max_gap_s: number;
+      max_gap_target_s: number;
+    }>),
 
   // ── Model deployment ──────────────────────────────────────────────
   deployableModels: () =>

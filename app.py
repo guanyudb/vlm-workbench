@@ -4252,6 +4252,10 @@ class IngestRequest(BaseModel):
     video_name: Optional[str] = None  # if None, ingest every new video in inbox
     candidate_fps: float = 1.0
     max_frames: int = 40
+    # Coverage floor: guarantee >=1 selected frame per this many seconds so
+    # content-driven selection can't leave timeline blind spots. None →
+    # notebook default clamp(2*dur/max_frames, 10s, 60s).
+    max_gap_seconds: Optional[float] = None
     force: bool = False  # if True, re-ingest even if status=ready
 
 
@@ -4460,6 +4464,7 @@ def kick_off_ingest(req: IngestRequest):
             "pg_instance": pg_instance,
             "candidate_fps": req.candidate_fps,
             "max_frames": req.max_frames,
+            "max_gap_seconds": req.max_gap_seconds,
         }
         import yaml
         ingest_yaml = yaml.safe_dump(ingest_cfg, sort_keys=False, allow_unicode=True)
@@ -4477,6 +4482,10 @@ def kick_off_ingest(req: IngestRequest):
             skipped.append({"name": name, "reason": f"yaml upload failed: {e}", "video_id": video_id})
             continue
 
+        # Serverless GPU (A10 + databricks_ai_v4): the v2 selector embeds
+        # candidates with DINOv2 — torch ships preinstalled in ai_v4, so this
+        # is both faster to start (no torch pip install) and gives the embed
+        # step a GPU. Same accelerator contract as the local-inference jobs.
         body = {
             "run_name": f"vlmwb_ingest_{video_stem}",
             "tasks": [{
@@ -4486,14 +4495,14 @@ def kick_off_ingest(req: IngestRequest):
                     "source": "WORKSPACE",
                     "base_parameters": {"config_yaml": yaml_path},
                 },
-                "environment_key": "cpu_env",
+                "environment_key": "gpu_env",
+                "compute": {"hardware_accelerator": "GPU_1xA10"},
             }],
             "queue": {"enabled": True},
             "environments": [{
-                "environment_key": "cpu_env",
-                "spec": {"environment_version": "5"},
+                "environment_key": "gpu_env",
+                "spec": {"base_environment": "databricks_ai_v4"},
             }],
-            "performance_target": "PERFORMANCE_OPTIMIZED",
         }
         try:
             resp = w.api_client.do("POST", "/api/2.1/jobs/runs/submit", body=body)
@@ -4519,6 +4528,107 @@ def kick_off_ingest(req: IngestRequest):
 class IngestImagesRequest(BaseModel):
     batch_name: Optional[str] = None  # if None, ingest every batch
     force: bool = False
+
+
+def _hybrid_coverage_select(pool: List[Dict[str, object]], k: int, y: float, dur: float):
+    """Coverage anchors (>=1 per y-second window) + bookends + best-value fill.
+    Pure function over sidecar candidate dicts (needs `timestamp_s`, `value`).
+    NOTE: keep in sync with `_select` in ingest_notebooks/smart_frames/
+    notebook.py — duplicated because notebooks are imported into the SP home
+    as single files and can't share a module with the app."""
+    import math as _math
+    pool = sorted(pool, key=lambda c: c["timestamp_s"])
+    n_min = max(1, _math.ceil(dur / y))
+    picked, anchor_keys = [], set()
+    for i in range(n_min):
+        w0, w1 = i * y, min((i + 1) * y, dur + 1e-6)
+        inwin = [c for c in pool if w0 <= c["timestamp_s"] < w1]
+        if inwin:
+            best = max(inwin, key=lambda c: c["value"])
+            if best not in picked:
+                picked.append(best)
+                anchor_keys.add(best["timestamp_s"])
+    for bk in (pool[0], pool[-1]):
+        if bk not in picked and len(picked) < max(k, n_min):
+            picked.append(bk)
+    remaining = sorted([c for c in pool if c not in picked], key=lambda c: -c["value"])
+    keff = min(max(k, n_min), len(pool))
+    for min_gap in (0.5 * y, 0.33 * y, 0.2 * y, 0.0):
+        for c in remaining:
+            if len(picked) >= keff:
+                break
+            if c in picked:
+                continue
+            if all(abs(c["timestamp_s"] - p["timestamp_s"]) >= min_gap for p in picked):
+                picked.append(c)
+        if len(picked) >= keff:
+            break
+    picked.sort(key=lambda c: c["timestamp_s"])
+    return picked, anchor_keys
+
+
+class ReselectRequest(BaseModel):
+    max_frames: int = 40
+    max_gap_seconds: Optional[float] = None
+
+
+@app.post("/api/videos/{video_id}/reselect")
+def reselect_frames(video_id: str, req: ReselectRequest):
+    """Re-run frame selection with new knobs WITHOUT re-running the GPU job.
+    v2 ingests persist every gated candidate (JPG + candidates.json sidecar),
+    so selection is just a value/coverage computation + a `selected`-flag flip
+    in the index. Instant vs. the ~minutes-long extraction job."""
+    if not _lakebase_available():
+        raise HTTPException(503, "Lakebase not configured")
+    _ensure_ingest_tables()
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT name FROM videos WHERE id = %s", (video_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"video {video_id} not found")
+    video_stem = os.path.splitext(row[0])[0]
+    sidecar_path = f"{EXTRACTED_FRAMES_DIR_DEFAULT}/{video_stem}/candidates.json"
+    try:
+        sidecar = json.loads(_download_bytes(sidecar_path))
+    except Exception:
+        raise HTTPException(
+            409,
+            "no candidates sidecar for this video — it was ingested before the "
+            "v2 selector. Re-ingest once to enable instant re-selection.",
+        )
+    pool = sidecar.get("candidates") or []
+    if not pool:
+        raise HTTPException(409, "sidecar has no candidates")
+    dur = float(sidecar.get("duration_s") or (max(c["timestamp_s"] for c in pool) + 1))
+    y = float(req.max_gap_seconds or min(60.0, max(10.0, 2.0 * dur / max(req.max_frames, 1))))
+
+    picked, anchor_keys = _hybrid_coverage_select(pool, req.max_frames, y, dur)
+    picked_paths = {c["frame_path"] for c in picked}
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            UPDATE extracted_frames_index
+            SET selected = (frame_path = ANY(%s)),
+                is_anchor = (timestamp_s = ANY(%s)),
+                updated_at = now()
+            WHERE video_id = %s
+        """, (list(picked_paths), [float(t) for t in anchor_keys], video_id))
+        cur.execute("""
+            UPDATE videos SET n_frames_extracted = %s,
+                status_message = %s, updated_at = now()
+            WHERE id = %s
+        """, (len(picked),
+              f"re-selected {len(picked)} of {len(pool)} candidates "
+              f"(max_frames={req.max_frames}, max_gap={y:.0f}s)",
+              video_id))
+    ts_sorted = [0.0] + sorted(c["timestamp_s"] for c in picked) + [dur]
+    max_gap = max(b - a for a, b in zip(ts_sorted, ts_sorted[1:]))
+    return {
+        "video_id": video_id,
+        "n_selected": len(picked),
+        "n_candidates": len(pool),
+        "max_gap_s": round(max_gap, 1),
+        "max_gap_target_s": y,
+    }
 
 
 @app.post("/api/images/ingest")
