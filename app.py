@@ -1272,12 +1272,15 @@ def list_frames(video: Optional[str] = None, source: str = "eval"):
         try:
             _ensure_ingest_tables()
             with _pg_conn() as conn, conn.cursor() as cur:
+                # `efi.selected` filters to the active pick set. v1/v1.5 only
+                # write selected rows (default true); v2 stores ALL gated
+                # candidates and flips this flag on reselect.
                 if video:
                     cur.execute("""
                         SELECT efi.frame_path, efi.frame_name, efi.timestamp_s, v.name
                         FROM extracted_frames_index efi
                         JOIN videos v ON v.id = efi.video_id
-                        WHERE v.name = %s OR v.name = %s
+                        WHERE (v.name = %s OR v.name = %s) AND efi.selected
                         ORDER BY efi.timestamp_s
                     """, (video, video.replace(".mp4", "") if video else ""))
                 else:
@@ -1285,6 +1288,7 @@ def list_frames(video: Optional[str] = None, source: str = "eval"):
                         SELECT efi.frame_path, efi.frame_name, efi.timestamp_s, v.name
                         FROM extracted_frames_index efi
                         JOIN videos v ON v.id = efi.video_id
+                        WHERE efi.selected
                         ORDER BY v.name, efi.timestamp_s
                     """)
                 rows = cur.fetchall()
@@ -4100,6 +4104,21 @@ def _ensure_ingest_tables():
             "CREATE INDEX IF NOT EXISTS extracted_frames_video_idx "
             "ON extracted_frames_index (video_id, timestamp_s)"
         )
+        # Smart-frames v2 migration (additive; see frame_selection_experiment/
+        # V2_EXECUTION_PLAN.md §B/D6). `grad` is the mask-aware blurred-gradient
+        # focus signal (better than Laplacian on scope footage); `selected`
+        # lets v2 store ALL gated candidates and treat selection as a cheap
+        # flag flip (reselect without re-running the GPU job); `phase_id` /
+        # `is_anchor` describe the narrative segmentation + coverage-floor
+        # role; `selector_version` supports v1/v2 A/B on the same table.
+        for ddl in (
+            "ALTER TABLE extracted_frames_index ADD COLUMN IF NOT EXISTS grad double precision",
+            "ALTER TABLE extracted_frames_index ADD COLUMN IF NOT EXISTS phase_id int",
+            "ALTER TABLE extracted_frames_index ADD COLUMN IF NOT EXISTS is_anchor boolean",
+            "ALTER TABLE extracted_frames_index ADD COLUMN IF NOT EXISTS selected boolean NOT NULL DEFAULT true",
+            "ALTER TABLE extracted_frames_index ADD COLUMN IF NOT EXISTS selector_version text",
+        ):
+            cur.execute(ddl)
     _INGEST_TABLES_READY = True
 
 
