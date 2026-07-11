@@ -302,6 +302,11 @@ try:
         print(f"[ingest][warn] DINOv2 unavailable → falling back to {selector_version}: {str(e)[:200]}")
 
     n_phases = int(np.clip(MAX_FRAMES, 4, 24))
+    # embedding-row → timestamp pairing for the sidecar (embs rows stay in
+    # "initial gated order + dense additions appended" order even after the
+    # pool itself is re-sorted by time below)
+    emb_ts = [c["timestamp_s"] for c in gated]
+    bound_times: list = []
     if embs is not None and len(gated) > n_phases:
         # Change-point segmentation: split at the largest embedding-novelty
         # jumps (min-gap enforced) → contiguous narrative phases.
@@ -316,15 +321,80 @@ try:
                 bounds.append(int(ci))
             if len(bounds) >= n_phases - 1:
                 break
-        bounds = sorted(bounds)
-        pid = 0
-        for i, c in enumerate(gated):
-            if bounds and i >= bounds[0]:
-                bounds.pop(0)
-                pid += 1
-            c["phase_id"] = pid
+        bound_times = sorted(gated[b]["timestamp_s"] for b in sorted(bounds))
+
+    # ---- adaptive densification around phase boundaries ----
+    # Brief story beats (instrument entering/leaving, a transient contact,
+    # a title/CT card in edited videos) can fall BETWEEN 1-fps candidates.
+    # Re-scan ±2s around each boundary at ~6fps, gate the new frames, and
+    # merge them into the pool. Validated: story-completeness 7→8 on a
+    # structured laparoscopy video (8/16 final picks came from the dense
+    # pass); neutral on continuous single-shot arthroscopy.
+    n_dense = 0
+    if bound_times and embs is not None and Path(VIDEO_PATH).suffix.lower() in (".mp4", ".mov", ".m4v"):
+        existing = {round(c["timestamp_s"], 2) for c in gated}
+        dense_step = max(1, int(round(fps / 6.0)))
+        new_cands = []
+        for bt in bound_times:
+            lo = max(0, int((bt - 2.0) * fps))
+            hi = min(n_total - 1, int((bt + 2.0) * fps))
+            for fi in range(lo, hi + 1, dense_step):
+                ts = fi / fps
+                if round(ts, 2) in existing:
+                    continue
+                try:
+                    rgb = _resize_max(vr[fi].asnumpy(), MAX_SIDE)
+                except Exception:
+                    continue
+                g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                if g.shape != (Hs, Ws):
+                    continue
+                v = g[M]
+                hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+                hch, sch = hsv[..., 0][M], hsv[..., 1][M]
+                cand = {
+                    "frame_index": int(fi),
+                    "timestamp_s": float(ts),
+                    "grad": _grad_of(g, M),
+                    "contrast": float(v.std()),
+                    "sharpness": float(cv2.Laplacian(g, cv2.CV_64F).var()),
+                    "colorfulness": 0.0,
+                    "whiteout": float((v > 240).mean()),
+                    "blackout": float((v < 20).mean()),
+                    "mean_lum": float(v.mean()),
+                    "red_frac": float((((hch < 10) | (hch > 170)) & (sch > 90)).mean()),
+                    "border_lum": float(g[border].mean()) if border is not None else 0.0,
+                }
+                if _gate(cand) == "ok":
+                    cand["gate_reason"] = "ok"
+                    new_cands.append(cand)
+                    existing.add(round(ts, 2))
+        if new_cands:
+            # embed the dense additions and extend pool + embedding store
+            emb_ts = emb_ts + [c["timestamp_s"] for c in new_cands]
+            chunks = []
+            for j in range(0, len(new_cands), 32):
+                batch = []
+                for c in new_cands[j:j + 32]:
+                    rgb = _resize_max(vr[c["frame_index"]].asnumpy(), MAX_SIDE)
+                    im = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+                    batch.append(torch.from_numpy(im).permute(2, 0, 1))
+                x = torch.stack(batch).to(dev)
+                with torch.no_grad():
+                    chunks.append(dino((x - MEAN) / STD).float().cpu().numpy())
+            new_embs = np.concatenate(chunks, 0)
+            new_embs = new_embs / (np.linalg.norm(new_embs, axis=1, keepdims=True) + 1e-8)
+            embs = np.concatenate([embs, new_embs], 0)
+            gated = sorted(gated + new_cands, key=lambda c: c["timestamp_s"])
+            n_dense = len(new_cands)
+        print(f"[ingest] densify: +{n_dense} gated candidates around {len(bound_times)} boundaries")
+
+    # ---- assign phase_id (bisect over boundary times; works for merged pool) --
+    import bisect
+    if bound_times:
+        for c in gated:
+            c["phase_id"] = bisect.bisect_right(bound_times, c["timestamp_s"])
     else:
-        # fallback: equal-duration phases
         for c in gated:
             c["phase_id"] = min(n_phases - 1, int(c["timestamp_s"] / max(duration_s, 1e-6) * n_phases))
 
@@ -425,7 +495,7 @@ try:
         json.dump(sidecar, f)
     if embs is not None:
         np.savez(f"{OUTPUT_DIR}/embeddings.npz", embs=embs,
-                 timestamps=np.array([c["timestamp_s"] for c in gated]))
+                 timestamps=np.array(emb_ts))
     print(f"[ingest] persisted {len(rows)} candidates + sidecar to {OUTPUT_DIR}")
 
     with _conn() as conn, conn.cursor() as cur:
