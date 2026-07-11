@@ -169,32 +169,44 @@ def _grad_of(gray, m_bool):
 # COMMAND ----------
 try:
     t0 = time.time()
-    vr = VideoReader(VIDEO_PATH, ctx=cpu(0))
-    n_total = len(vr)
-    fps = float(vr.get_avg_fps())
+    # Probe with a throwaway full-res reader, then run ALL analysis through a
+    # decode-time-resized reader (decord scales inside the decoder). The first
+    # v1.5 run OOM'd on serverless CPU (74s, "Execution ran out of memory")
+    # decoding full-res frames and downscaling in numpy — decode-time resize
+    # keeps peak memory at ~one small frame regardless of source resolution.
+    # A separate full-res reader is opened only for writing the final JPGs.
+    _probe = VideoReader(VIDEO_PATH, ctx=cpu(0))
+    n_total = len(_probe)
+    fps = float(_probe.get_avg_fps())
     duration_s = n_total / max(fps, 0.001)
+    h0, w0 = _probe[0].asnumpy().shape[:2]
+    del _probe
+    _scale = min(1.0, MAX_SIDE / max(h0, w0))
+    Ws, Hs = (int(w0 * _scale) // 2) * 2, (int(h0 * _scale) // 2) * 2  # decoder wants even dims
+    vr = VideoReader(VIDEO_PATH, ctx=cpu(0), width=Ws, height=Hs)
+
     step = max(1, int(fps / CANDIDATE_FPS))
     indices = list(range(0, n_total, step))
     if MAX_GAP_S is None:
         MAX_GAP_S = float(np.clip(2.0 * duration_s / max(MAX_FRAMES, 1), 10.0, 60.0))
-    print(f"[ingest] {n_total} frames @ {fps:.1f}fps = {duration_s:.1f}s; "
-          f"{len(indices)} candidates; max_gap={MAX_GAP_S:.0f}s")
+    print(f"[ingest] {n_total} frames @ {fps:.1f}fps = {duration_s:.1f}s "
+          f"({w0}x{h0} → analysis {Ws}x{Hs}); {len(indices)} candidates; max_gap={MAX_GAP_S:.0f}s")
     _set_video_status("processing", f"{n_total} frames @ {fps:.1f}fps", duration_s=duration_s)
 
-    # ---- pass A: grays only → scope mask (memory-flat on long videos) ----
-    grays, ok_idx = [], []
+    # ---- pass A: running-max luminance → scope mask (O(1) memory) ----
+    max_lum = np.zeros((Hs, Ws), dtype=np.uint8)
+    ok_idx = []
     for idx in indices:
         try:
-            rgb = _resize_max(vr[idx].asnumpy(), MAX_SIDE)
+            g = cv2.cvtColor(vr[idx].asnumpy(), cv2.COLOR_RGB2GRAY)
         except Exception:
             continue
-        grays.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
+        np.maximum(max_lum, g, out=max_lum)
         ok_idx.append(idx)
-    if not grays:
+    if not ok_idx:
         raise RuntimeError("no decodable candidate frames")
-    Hs, Ws = grays[0].shape
 
-    mask = (np.max(np.stack(grays), axis=0) > 25).astype(np.uint8)
+    mask = (max_lum > 25).astype(np.uint8)
     ncc, lab = cv2.connectedComponents(mask)
     if ncc > 1:
         biggest = 1 + int(np.argmax([(lab == i).sum() for i in range(1, ncc)]))
@@ -209,14 +221,14 @@ try:
     print(f"[ingest] scope mask covers {M.mean()*100:.0f}% "
           f"({'full-frame fallback' if full_frame else 'circle'})")
 
-    # ---- pass B: signals per candidate ----
+    # ---- pass B: re-decode (small), signals per candidate ----
     candidates = []
-    for gi, idx in enumerate(ok_idx):
+    for idx in ok_idx:
         try:
-            rgb = _resize_max(vr[idx].asnumpy(), MAX_SIDE)
+            rgb = vr[idx].asnumpy()
         except Exception:
             continue
-        g = grays[gi]
+        g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         v = g[M]
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         hch, sch = hsv[..., 0][M], hsv[..., 1][M]
@@ -288,7 +300,7 @@ try:
         for j in range(0, len(gated), B):
             batch = []
             for c in gated[j:j + B]:
-                rgb = _resize_max(vr[c["frame_index"]].asnumpy(), MAX_SIDE)
+                rgb = vr[c["frame_index"]].asnumpy()
                 im = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
                 batch.append(torch.from_numpy(im).permute(2, 0, 1))
             x = torch.stack(batch).to(dev)
@@ -343,7 +355,7 @@ try:
                 if round(ts, 2) in existing:
                     continue
                 try:
-                    rgb = _resize_max(vr[fi].asnumpy(), MAX_SIDE)
+                    rgb = vr[fi].asnumpy()
                 except Exception:
                     continue
                 g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -376,7 +388,7 @@ try:
             for j in range(0, len(new_cands), 32):
                 batch = []
                 for c in new_cands[j:j + 32]:
-                    rgb = _resize_max(vr[c["frame_index"]].asnumpy(), MAX_SIDE)
+                    rgb = vr[c["frame_index"]].asnumpy()
                     im = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
                     batch.append(torch.from_numpy(im).permute(2, 0, 1))
                 x = torch.stack(batch).to(dev)
@@ -456,7 +468,7 @@ try:
                 if fi == c["frame_index"]:
                     continue
                 try:
-                    g2 = cv2.cvtColor(_resize_max(vr[fi].asnumpy(), MAX_SIDE), cv2.COLOR_RGB2GRAY)
+                    g2 = cv2.cvtColor(vr[fi].asnumpy(), cv2.COLOR_RGB2GRAY)
                 except Exception:
                     continue
                 if g2.shape != (Hs, Ws):
@@ -473,13 +485,17 @@ try:
 
     # ---- persist candidates + sidecar + register in Lakebase ----
     # (no `# COMMAND ----------` inside try — Databricks would split the cell)
+    # Full-res reader ONLY here: sequential single-frame decode + immediate
+    # downscale to SAVE_SIDE keeps peak memory at ~one full frame.
+    del vr
+    vr_full = VideoReader(VIDEO_PATH, ctx=cpu(0))
     video_stem = Path(VIDEO_NAME).stem
     rows = []
-    for c in gated:
+    for c in sorted(gated, key=lambda c: c["frame_index"]):
         is_sel = c["timestamp_s"] in sel_keys
         filename = f"{video_stem}_frame_{c['timestamp_s']:07.2f}s.jpg"
         out_path = f"{CAND_DIR}/{filename}"
-        Image.fromarray(_resize_max(vr[c["frame_index"]].asnumpy(), SAVE_SIDE)).save(
+        Image.fromarray(_resize_max(vr_full[c["frame_index"]].asnumpy(), SAVE_SIDE)).save(
             out_path, format="JPEG", quality=88)
         rows.append({**c, "frame_path": out_path, "frame_name": filename,
                      "selected": is_sel,
