@@ -4979,9 +4979,12 @@ def kick_off_ingest(req: IngestRequest):
                 # in-notebook `%pip install`/`%restart_python` — that step
                 # spiked driver memory and OOM-killed the job. numpy/pillow/
                 # pyyaml come from the base image.
+                # OpenCV is pinned: 4.14 and 5.0 wheels SIGABRT on `import cv2`
+                # on serverless env v5 (py3.12, numpy 2.1.3); 4.10-4.12 work
+                # (probed 2026-10-09: decord+cv2 decode at ~260 MB peak).
                 "spec": {
                     "environment_version": "5",
-                    "dependencies": ["decord", "opencv-python-headless", "psycopg[binary]"],
+                    "dependencies": ["decord==0.6.0", "opencv-python-headless==4.12.0.88", "psycopg[binary]"],
                 },
             }],
             "performance_target": "PERFORMANCE_OPTIMIZED",

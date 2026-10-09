@@ -42,7 +42,7 @@
 
 # COMMAND ----------
 # NOTE: NO in-notebook `%pip install` / `%restart_python`.
-# The extra deps (decord, opencv-python-headless, psycopg[binary]) are declared
+# The extra deps (decord, opencv-python-headless==4.12.0.88, psycopg[binary]) are declared
 # in the JOB's serverless environment spec (`environments[].spec.dependencies`
 # in app.py's ingest submit), so the platform pre-builds the environment BEFORE
 # the notebook runs. An in-notebook `%pip install` + `%restart_python` spiked
