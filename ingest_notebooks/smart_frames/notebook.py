@@ -844,8 +844,13 @@ try:
     with open(f"{OUTPUT_DIR}/candidates.json", "w") as f:
         json.dump(sidecar, f)
     if embs is not None:
-        np.savez(f"{OUTPUT_DIR}/embeddings.npz", embs=embs,
-                 timestamps=np.array(emb_ts))
+        # The Volume FUSE mount can't seek while writing (npz is a zip that
+        # does) → [Errno 5]. Build it on local disk, then copy sequentially.
+        import shutil, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as _tmp:
+            np.savez(_tmp, embs=embs, timestamps=np.array(emb_ts))
+        shutil.copyfile(_tmp.name, f"{OUTPUT_DIR}/embeddings.npz")
+        os.remove(_tmp.name)
     print(f"[ingest] persisted {len(rows)} candidates + sidecar to {OUTPUT_DIR}")
 
     with _conn() as conn, conn.cursor() as cur:
