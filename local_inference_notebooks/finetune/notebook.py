@@ -64,7 +64,9 @@ UC_FULL = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
 OUTPUT_DIR = cfg["output_dir"]
 TRAIN_DATA = list(cfg.get("training_data", []))
 TRAIN_PROMPT = cfg["train_prompt"]
-EXPERIMENT_PATH = cfg.get("mlflow_experiment") or "/Users/guanyu.chen@databricks.com/vlmwb-experiments"
+EXPERIMENT_PATH = cfg.get("mlflow_experiment")
+if not EXPERIMENT_PATH:
+    raise RuntimeError("mlflow_experiment must be provided in cfg")
 
 LORA = cfg.get("lora", {})
 LORA_R = int(LORA.get("r", 16))
@@ -498,7 +500,11 @@ with mlflow.start_run(run_name=RUN_ID) as run:
             "default_prompt": TRAIN_PROMPT,
         },
     )
-    mlflow_url = f"{mlflow.get_tracking_uri()}#/experiments/{run.info.experiment_id}/runs/{training_run_id}"
+    # Build a real workspace URL for MLflow run (not the databricks: pseudo-scheme).
+    # Extract workspace host from tracking URI and construct proper HTTPS URL.
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+    mlflow_url = f"{w.config.host}/ml/experiments/{run.info.experiment_id}/runs/{training_run_id}"
     print(f"[ft] mlflow run url: {mlflow_url}")
 
 # COMMAND ----------

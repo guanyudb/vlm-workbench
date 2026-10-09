@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, CheckCircle2, ChevronLeft, ChevronRight, Database, Loader2, RefreshCcw, Save, Tag, Trash2, Wand2, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { CheckCircle2, ChevronLeft, ChevronRight, Database, Loader2, RefreshCcw, Save, Tag, Trash2, Wand2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -13,8 +13,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { api, resolvePath, type FrameLabel, type RunResultRow, type SnapshotSummary, type TaskResponseSchema } from "@/api";
+import { api, resolvePath, type FrameLabel, type RunResultRow, type SnapshotSummary, type TaskResponseSchema, type VideoEntry } from "@/api";
 import { cn } from "@/lib/utils";
+import { useConfirm, ConfirmDialog, useAlert, AlertDialog } from "@/lib/use-dialog";
+import { useToast } from "@/lib/toast-context";
+import { useLazyList } from "@/lib/use-lazy-list";
 
 // Fallback vocab used until /api/task-config resolves. The active vocab is
 // fetched at mount and rendered into the picker + hotkey map below.
@@ -65,16 +68,26 @@ type StagedFrame = {
 };
 
 export default function LabelTab() {
+  // Dialog and toast hooks
+  const confirmDelete = useConfirm();
+  const alertError = useAlert();
+  const { addToast } = useToast();
+
   // ── snapshot picker ─────────────────────────────────────────────────
   const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string>("");
   const [bootstrapping, setBootstrapping] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
 
+  // ── video scope selector ────────────────────────────────────────────
+  const [videos, setVideos] = useState<VideoEntry[]>([]);
+  const [selectedVideo, setSelectedVideo] = useState<string>("");
+
   // ── workspace ───────────────────────────────────────────────────────
   const [staged, setStaged] = useState<StagedFrame[]>([]);
   const [idx, setIdx] = useState(0);
   const [stats, setStats] = useState<{ total: number; by_instrument: { instrument: string; n: number }[] } | null>(null);
+  const [batchSaving, setBatchSaving] = useState(false);
 
   // Task config (vocabulary + response schema) — single source of truth
   // shared with Playground (prompt), the optimizer, and snapshot
@@ -119,6 +132,25 @@ export default function LabelTab() {
 
   useEffect(() => {
     api.listSnapshots(40).then(setSnapshots).catch(() => {});
+    // Load videos from ingest list (has status and timestamps)
+    api.ingestVideos().then((r) => {
+      const ingestVideos = r.videos;
+      // Convert to VideoEntry-like format for display, but keep full data
+      setVideos(ingestVideos.map(v => ({ name: v.name, path: v.path || "", size_bytes: v.size_bytes || 0 })) as any);
+      // Default to most recently updated *ready* video
+      if (!selectedVideo) {
+        const readyVideos = ingestVideos.filter(v => v.status === "ready");
+        if (readyVideos.length > 0) {
+          // Sort by updated_at descending (most recent first)
+          const sorted = [...readyVideos].sort((a, b) => {
+            const aTime = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+            const bTime = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+            return bTime - aTime;
+          });
+          setSelectedVideo(sorted[0].name);
+        }
+      }
+    }).catch(() => {});
     refreshStats();
   }, []);
 
@@ -210,9 +242,33 @@ export default function LabelTab() {
     }
   };
 
-  const current = staged[idx];
+  // Filter staged frames by selected video. Frames live under
+  // .../extracted_frames/<stem>/[candidates/]<stem>_frame_<t>s.jpg, and
+  // selectedVideo is the filename (case1.mp4), so match on its stem.
+  const scopeStem = selectedVideo ? selectedVideo.replace(/\.[^.]+$/, "") : "";
+  const inScope = (s: StagedFrame) => {
+    if (!scopeStem) return true;
+    const p = s.frame_path || "";
+    return p.includes(`/${scopeStem}/`) || (p.split("/").pop() || "").startsWith(`${scopeStem}_frame_`);
+  };
+  const visibleStaged = useMemo(
+    () => staged.filter(inScope),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [staged, scopeStem],
+  );
+  // idx indexes visibleStaged; restart at the first frame when the scope changes.
+  useEffect(() => { setIdx(0); }, [scopeStem]);
+  const { displayedItems: stripItems, sentinelRef: stripSentinelRef, hasMore: stripHasMore } =
+    useLazyList(visibleStaged, 50);
+
+  // `idx` is a position in visibleStaged, but state lives in the full `staged`
+  // array — so every mutation targets the frame by path, never by index.
+  const current = visibleStaged[idx];
   const updateDraft = (patch: Partial<StagedFrame["draft"]>) => {
-    setStaged((cur) => cur.map((s, i) => i === idx ? { ...s, draft: { ...s.draft, ...patch } } : s));
+    const fp = current?.frame_path;
+    setStaged((cur) => cur.map((s) => s.frame_path === fp
+      ? { ...s, draft: { ...s.draft, ...patch }, status: "pending" as const }
+      : s));
   };
 
   // After save/skip, advance: prefer the next frame whose status is still
@@ -244,51 +300,129 @@ export default function LabelTab() {
         source: `snapshot:${selectedSnapshotId}:${predictedModel}`,
       });
       setStaged((cur) => {
-        const next = cur.map((s, i) =>
-          i === myIdx ? { ...s, status: "saved" as const, existing: saved } : s
+        const next = cur.map((s) =>
+          s.frame_path === framePath ? { ...s, status: "saved" as const, existing: saved } : s
         );
-        setIdx(advanceFrom(myIdx, next));
+        setIdx(advanceFrom(myIdx, next.filter(inScope)));
         return next;
       });
       refreshStats();
     } catch (e) {
-      alert(`Save failed: ${(e as Error).message}`);
+      alertError.show({
+        title: "Save failed",
+        description: (e as Error).message,
+        onConfirm: () => {},
+      });
     }
   };
 
   const skipCurrent = () => {
+    if (!current) return;
     const myIdx = idx;
+    const fp = current.frame_path;
     setStaged((cur) => {
-      const next = cur.map((s, i) => i === myIdx ? { ...s, status: "skipped" as const } : s);
-      setIdx(advanceFrom(myIdx, next));
+      const next = cur.map((s) => s.frame_path === fp ? { ...s, status: "skipped" as const } : s);
+      setIdx(advanceFrom(myIdx, next.filter(inScope)));
       return next;
     });
   };
 
+  // Batch save all drafts at once via POST /api/labels/batch
+  const saveAllDrafts = async () => {
+    const toSave = visibleStaged.filter(
+      (s) => s.draft.instrument && s.status !== "saved" && s.status !== "skipped"
+    );
+    if (toSave.length === 0) {
+      addToast({
+        title: "Nothing to save",
+        description: "All drafts are either already saved or skipped",
+        variant: "default",
+      });
+      return;
+    }
+
+    setBatchSaving(true);
+    try {
+      const rows = toSave.map((s) => ({
+        frame_path: s.frame_path,
+        instrument: s.draft.instrument,
+        anatomy: s.draft.anatomy,
+        tissue_condition: s.draft.tissue_condition,
+        notes: s.draft.notes,
+        source: `snapshot:${selectedSnapshotId}:${s.predicted.model}`,
+      }));
+      const result = await api.upsertLabelsBatch(rows);
+      const resultMap = new Map(result.rows.map((l) => [l.frame_path, l]));
+      setStaged((cur) =>
+        cur.map((s) => {
+          const saved = resultMap.get(s.frame_path);
+          return saved ? { ...s, status: "saved" as const, existing: saved } : s;
+        })
+      );
+      refreshStats();
+      addToast({
+        title: "Batch saved",
+        description: `${result.inserted} frames saved`,
+        variant: "success",
+      });
+    } catch (e) {
+      alertError.show({
+        title: "Batch save failed",
+        description: (e as Error).message,
+        onConfirm: () => {},
+      });
+    } finally {
+      setBatchSaving(false);
+    }
+  };
+
   const deleteCurrent = async () => {
     if (!current || !current.existing) return;
-    if (!confirm(`Delete the existing label for ${frameBasename(current.frame_path)}?`)) return;
-    try {
-      await api.deleteLabel(current.frame_path);
-      setStaged((cur) => cur.map((s, i) => i === idx ? { ...s, existing: null, status: "pending" } : s));
-      refreshStats();
-    } catch (e) {
-      alert(`Delete failed: ${(e as Error).message}`);
-    }
+    confirmDelete.show({
+      title: "Delete label",
+      description: `Remove the existing label for ${frameBasename(current.frame_path)}?`,
+      okText: "Delete",
+      cancelText: "Cancel",
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          await api.deleteLabel(current.frame_path);
+          const fp = current.frame_path;
+          setStaged((cur) => cur.map((s) => s.frame_path === fp ? { ...s, existing: null, status: "pending" } : s));
+          refreshStats();
+          addToast({
+            title: "Label deleted",
+            variant: "success",
+          });
+        } catch (e) {
+          alertError.show({
+            title: "Delete failed",
+            description: (e as Error).message,
+            onConfirm: () => {},
+          });
+        }
+      },
+    });
   };
 
   // Keyboard shortcuts. Number keys → instrument vocab[0..8]; enter → save+next; → ← navigate; s → skip
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!current) return;
-      // Don't hijack when typing in inputs (except for ctrl+enter to save)
-      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
-      const inField = tag === "input" || tag === "textarea";
+      // Don't hijack when typing in inputs/selects/contenteditable
+      const target = e.target as HTMLElement;
+      const tag = target?.tagName?.toLowerCase();
+      const role = target?.getAttribute?.("role");
+      const isSelectOrCombo = role === "combobox" || role === "listbox" || (target as any).closest("[role='dialog']");
+      const isEditable = tag === "input" || tag === "textarea" || target?.contentEditable === "true" || isSelectOrCombo;
+
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault(); saveCurrent(); return;
+        if (!isEditable) e.preventDefault();
+        saveCurrent();
+        return;
       }
-      if (inField) return;
-      if (e.key === "ArrowRight") { e.preventDefault(); setIdx((i) => Math.min(staged.length - 1, i + 1)); }
+      if (isEditable) return;
+      if (e.key === "ArrowRight") { e.preventDefault(); setIdx((i) => Math.min(visibleStaged.length - 1, i + 1)); }
       else if (e.key === "ArrowLeft") { e.preventDefault(); setIdx((i) => Math.max(0, i - 1)); }
       else if (e.key === "Enter") { e.preventDefault(); saveCurrent(); }
       else if (e.key === "s" || e.key === "S") { e.preventDefault(); skipCurrent(); }
@@ -300,17 +434,17 @@ export default function LabelTab() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current?.frame_path, current?.draft.instrument, staged]);
+  }, [current?.frame_path, current?.draft.instrument, visibleStaged]);
 
   const counts = useMemo(() => {
     let pending = 0, saved = 0, skipped = 0;
-    for (const s of staged) {
+    for (const s of visibleStaged) {
       if (s.status === "saved") saved += 1;
       else if (s.status === "skipped") skipped += 1;
       else pending += 1;
     }
     return { pending, saved, skipped };
-  }, [staged]);
+  }, [visibleStaged]);
 
   return (
     <div className="space-y-6">
@@ -374,6 +508,21 @@ export default function LabelTab() {
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="flex flex-wrap items-end gap-3">
+            <div className="min-w-48">
+              <Label className="text-xs">Video scope (optional filter)</Label>
+              {/* Radix Select forbids value="" on items — use a sentinel for "all". */}
+              <Select value={selectedVideo || "__all__"} onValueChange={(v) => setSelectedVideo(v === "__all__" ? "" : v)}>
+                <SelectTrigger><SelectValue placeholder="All videos" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">All videos</SelectItem>
+                  {videos.map((v) => (
+                    <SelectItem key={v.name} value={v.name}>
+                      {v.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
             <div className="min-w-72 flex-1">
               <Label className="text-xs">Snapshot</Label>
               <Select value={selectedSnapshotId} onValueChange={setSelectedSnapshotId}>
@@ -403,12 +552,12 @@ export default function LabelTab() {
       </Card>
 
       {/* Per-frame verify view */}
-      {staged.length > 0 && current && (
+      {visibleStaged.length > 0 && current && (
         <Card>
           <CardHeader className="pb-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <CardTitle className="text-base">Verify · {idx + 1} of {staged.length}</CardTitle>
+                <CardTitle className="text-base">Verify · {idx + 1} of {visibleStaged.length}</CardTitle>
                 <CardDescription className="font-mono text-xs">{frameBasename(current.frame_path)}</CardDescription>
               </div>
               <div className="flex items-center gap-1.5 text-xs">
@@ -533,6 +682,10 @@ export default function LabelTab() {
                   <Button onClick={saveCurrent} variant="default" className="gap-2" disabled={!current.draft.instrument}>
                     <Save className="size-4" /> Save & next
                   </Button>
+                  <Button onClick={saveAllDrafts} variant="outline" className="gap-2" disabled={batchSaving || counts.pending === 0}>
+                    {batchSaving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                    Save all drafts
+                  </Button>
                   <Button onClick={skipCurrent} variant="outline">
                     Skip
                   </Button>
@@ -545,7 +698,7 @@ export default function LabelTab() {
                   <Button variant="outline" disabled={idx === 0} onClick={() => setIdx((i) => Math.max(0, i - 1))}>
                     <ChevronLeft className="size-4" />
                   </Button>
-                  <Button variant="outline" disabled={idx >= staged.length - 1} onClick={() => setIdx((i) => Math.min(staged.length - 1, i + 1))}>
+                  <Button variant="outline" disabled={idx >= visibleStaged.length - 1} onClick={() => setIdx((i) => Math.min(visibleStaged.length - 1, i + 1))}>
                     <ChevronRight className="size-4" />
                   </Button>
                 </div>
@@ -555,36 +708,66 @@ export default function LabelTab() {
         </Card>
       )}
 
-      {/* Strip thumbnail navigator */}
-      {staged.length > 1 && (
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base">Frames</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-1.5">
-              {staged.map((s, i) => (
-                <button
-                  key={s.frame_path}
-                  onClick={() => setIdx(i)}
-                  className={cn(
-                    "relative h-12 w-16 overflow-hidden rounded border transition-all",
-                    i === idx ? "border-primary ring-2 ring-primary/30" : "border-border hover:border-primary/60",
-                  )}
-                  title={frameBasename(s.frame_path)}
-                >
-                  <img src={api.frameImageUrl(s.frame_path)} className="h-full w-full object-cover" />
-                  <span className={cn(
-                    "absolute right-0.5 top-0.5 inline-block size-2 rounded-full",
-                    s.status === "saved" ? "bg-emerald-500" :
-                    s.status === "skipped" ? "bg-muted-foreground" : "bg-amber-500"
-                  )} />
-                </button>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
+      {/* Strip thumbnail navigator with lazy loading */}
+      {visibleStaged.length > 1 && (() => {
+        const displayedItems = stripItems, sentinelRef = stripSentinelRef, hasMore = stripHasMore;
+        return (
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base">Frames {visibleStaged.length > 50 ? `(${displayedItems.length}/${visibleStaged.length})` : ""}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-wrap gap-1.5">
+                {displayedItems.map((s, actualIdx) => {
+                  return (
+                    <button
+                      key={s.frame_path}
+                      onClick={() => setIdx(actualIdx)}
+                      className={cn(
+                        "relative h-12 w-16 overflow-hidden rounded border transition-all",
+                        actualIdx === idx ? "border-primary ring-2 ring-primary/30" : "border-border hover:border-primary/60",
+                      )}
+                      title={frameBasename(s.frame_path)}
+                    >
+                      <img
+                        src={api.frameImageUrl(s.frame_path)}
+                        loading="lazy"
+                        className="h-full w-full object-cover"
+                      />
+                      <span className={cn(
+                        "absolute right-0.5 top-0.5 inline-block size-2 rounded-full",
+                        s.status === "saved" ? "bg-emerald-500" :
+                        s.status === "skipped" ? "bg-muted-foreground" : "bg-amber-500"
+                      )} />
+                    </button>
+                  );
+                })}
+                {hasMore && <div ref={sentinelRef} className="h-12 w-16" />}
+              </div>
+              {hasMore && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Scroll to load more frames...
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })()}
+
+      {/* Dialogs */}
+      <ConfirmDialog
+        open={confirmDelete.confirmState.open}
+        options={confirmDelete.confirmState.options}
+        onConfirm={confirmDelete.handleConfirm}
+        onCancel={confirmDelete.handleCancel}
+        confirming={confirmDelete.confirming}
+      />
+      <AlertDialog
+        open={alertError.state.open}
+        options={alertError.state.options}
+        onOk={alertError.handleOk}
+        onClose={alertError.hide}
+      />
     </div>
   );
 }

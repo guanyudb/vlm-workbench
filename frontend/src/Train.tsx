@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  AlertCircle, CheckCircle2, ExternalLink, Loader2, Play, RefreshCcw,
-  Settings, Sparkles, Wand2, X, XCircle,
+  AlertCircle, CheckCircle2, ExternalLink, Loader2, RefreshCcw,
+  Settings, Sparkles, X, XCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -19,6 +19,7 @@ import {
   type SnapshotSummary,
 } from "@/api";
 import { usePersistentState } from "@/lib/use-persistent-state";
+import { usePolling } from "@/lib/use-polling";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_FT_PROMPT = `Identify the surgical instrument by its visible visual features. Respond with strict JSON: {"instrument": "<class>", "anatomy": "<short>", "tissue_condition": "<short>"} where <class> is one of: probe, shaver, burr, grasper, biter, suture_passer, anchor_driver, electrocautery, cannula, scissors, drill_guide, trocar, knot_pusher, rasp, other_metal_tool, no_instrument_visible.`;
@@ -35,6 +36,7 @@ type ActiveFT = {
   state: "submitting" | "running" | "succeeded" | "failed";
   result_state?: string | null;
   state_message?: string | null;
+  error_detail?: string | null;
   run_page_url?: string | null;
   result?: any;
   started_at: number;
@@ -57,8 +59,13 @@ export default function Train() {
   // workbench shows the *actual* registered name regardless of workspace.
   const [ucCatalog, setUcCatalog] = useState<string>("<catalog>");
   const [ucSchema, setUcSchema] = useState<string>("<schema>");
+  const [mlflowExperimentPath, setMlflowExperimentPath] = useState<string | null>(null);
   useEffect(() => {
-    api.health().then((h) => { setUcCatalog(h.uc_catalog); setUcSchema(h.uc_schema); }).catch(() => {});
+    api.health().then((h) => {
+      setUcCatalog(h.uc_catalog);
+      setUcSchema(h.uc_schema);
+      setMlflowExperimentPath(h.mlflow_experiment_path || null);
+    }).catch(() => {});
   }, []);
   const [localModels, setLocalModels] = useState<LocalModelEntry[]>([]);
   const [labelStats, setLabelStats] = useState<{ total: number; by_instrument: { instrument: string; n: number }[] } | null>(null);
@@ -147,12 +154,10 @@ export default function Train() {
 
   // Poller for in-flight fine-tune jobs. Tolerant of transient 502s — only
   // gives up after 10 consecutive errors per run.
-  useEffect(() => {
-    const inflight = activeRuns.filter((r) => r.state === "running" || r.state === "submitting");
-    if (inflight.length === 0) return;
-    let stopped = false;
-    const poll = async () => {
-      if (stopped) return;
+  const hasInflightFT = activeRuns.some((r) => r.state === "running" || r.state === "submitting");
+  usePolling(
+    async () => {
+      const inflight = activeRuns.filter((r) => r.state === "running" || r.state === "submitting");
       const updates: Record<string, Partial<ActiveFT>> = {};
       await Promise.all(inflight.map(async (r) => {
         if (r.state !== "running" || !r.databricks_run_id) return;
@@ -166,6 +171,7 @@ export default function Train() {
               state: ok ? "succeeded" : "failed",
               result_state: s.result_state,
               state_message: s.state_message,
+              error_detail: s.error_detail,
               run_page_url: s.run_page_url,
               result: s.result,
               finished_at: Date.now(),
@@ -184,7 +190,7 @@ export default function Train() {
           }
         }
       }));
-      if (stopped || Object.keys(updates).length === 0) return;
+      if (Object.keys(updates).length === 0) return;
       setActiveRuns((cur) => cur.map((r) => updates[r.run_id] ? { ...r, ...updates[r.run_id] } : r));
       // If anything just succeeded, refresh local models so the new fine-tuned
       // model shows up in Playground's Local section immediately.
@@ -192,12 +198,10 @@ export default function Train() {
         api.localModels().then(setLocalModels).catch(() => {});
         api.finetuneRuns(25).then(setPastRuns).catch(() => {});
       }
-    };
-    poll();
-    const interval = setInterval(poll, 12000);
-    return () => { stopped = true; clearInterval(interval); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeRuns.filter((r) => r.state === "running" || r.state === "submitting").map((r) => r.run_id).join(",")]);
+    },
+    12000,
+    () => !hasInflightFT
+  );
 
   const totalLabels = labelStats?.total ?? 0;
   // The matched count (from preview) is what training will actually receive.
@@ -256,7 +260,7 @@ export default function Train() {
           uc_model_name: r.uc_model_name,
           base_model_name: baseModel,
           n_train: r.n_train,
-          state: "running",
+          state: "running" as const,
           started_at: Date.now(),
         },
         ...cur,
@@ -696,12 +700,12 @@ export default function Train() {
         <CardHeader className="flex flex-row items-center justify-between pb-3">
           <div>
             <CardTitle className="text-base">Run history</CardTitle>
-            <CardDescription>From MLflow experiment {`/Users/guanyu.chen@databricks.com/vlm-workbench`}</CardDescription>
+            <CardDescription>From MLflow experiment {mlflowExperimentPath ? `"${mlflowExperimentPath}"` : "(loading…)"}</CardDescription>
           </div>
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => { setPastLoading(true); api.finetuneRuns(25).then(setPastRuns).finally(() => setPastLoading(false)); }}
+            onClick={() => { setPastLoading(true); api.finetuneRuns(25).then(setPastRuns).catch(() => {}).finally(() => setPastLoading(false)); }}
           >
             <RefreshCcw className="size-3.5" />
           </Button>
@@ -784,9 +788,14 @@ function ActiveRunCard({
             </div>
           )}
           {run.state === "failed" && (
-            <p className="mt-1 text-xs text-destructive">
-              {run.state_message || "Job failed — see Databricks Job page for details."}
-            </p>
+            <details className="mt-1">
+              <summary className="cursor-pointer text-xs text-destructive font-medium">
+                {run.state_message || "Job failed"}
+              </summary>
+              {run.error_detail && (
+                <p className="mt-1 max-w-xs text-xs text-destructive whitespace-pre-wrap break-words">{run.error_detail}</p>
+              )}
+            </details>
           )}
           {(run.state === "running" || run.state === "submitting") && (
             <p className="mt-1 text-xs text-muted-foreground">

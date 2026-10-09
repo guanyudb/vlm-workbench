@@ -29,6 +29,7 @@ os.environ.setdefault("MLFLOW_ENABLE_DB_SDK", "1")
 os.environ.setdefault("MLFLOW_TRACKING_URI", "databricks")
 os.environ.setdefault("MLFLOW_REGISTRY_URI", "databricks-uc")
 import re
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator, Dict, List, Optional
@@ -38,7 +39,6 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image
-from sse_starlette.sse import EventSourceResponse
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vlm-workbench")
@@ -321,7 +321,6 @@ LAKEBASE_DBNAME = (
     or "vlm_workbench"
 )
 LAKEBASE_PORT = int(os.environ.get("PGPORT") or os.environ.get("LAKEBASE_PORT") or 5432)
-LAKEBASE_SSLMODE = os.environ.get("PGSSLMODE", "require")
 
 _token_cache: Dict[str, object] = {"token": None, "expires_at": 0}
 
@@ -463,6 +462,102 @@ def _infer_run_kind(run_name: str) -> str:
     return "other"
 
 
+# ── Active runs cache (for ingest guards) ────────────────────────────────
+# Cache active runs to avoid hammering Jobs API on every ingest check.
+# TTL: 30s so quick re-submits detect duplicates, but doesn't become stale.
+_active_runs_cache: Dict[str, object] = {"runs": {}, "expires_at": 0}
+
+# ── Run failure detail cache ─────────────────────────────────────────────
+# Cache failure details per run_id to avoid refetching once terminal
+_failure_detail_cache: Dict[str, Optional[str]] = {}
+
+
+def _get_active_ingest_runs() -> Optional[Dict[str, Dict[str, object]]]:
+    """Active ingest runs keyed by video stem, cached ~30 s.
+    Returns None when the Jobs API can't be read — callers must treat that as
+    "unknown", never as "nothing running" (the watchdog would otherwise fail
+    healthy in-flight ingests on a transient API error)."""
+    now = time.time()
+    if _active_runs_cache.get("runs") is not None and float(_active_runs_cache.get("expires_at", 0)) > now:
+        return dict(_active_runs_cache["runs"])  # return a copy
+
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+    active_by_video: Dict[str, Dict[str, object]] = {}
+    try:
+        # active_only covers every non-terminal state; the explicit set below
+        # is a second guard (INTERNAL_ERROR / TERMINATED / SKIPPED are terminal).
+        for r in w.jobs.list_runs(active_only=True, limit=25):
+            name = r.run_name or ""
+            if not name.startswith("vlmwb_ingest_"):
+                continue
+            # Extract video stem from run_name (vlmwb_ingest_<stem>)
+            video_stem = name[len("vlmwb_ingest_"):]
+            s = r.state
+            life = (s.life_cycle_state.value if s and s.life_cycle_state else "") or ""
+            if life in ("QUEUED", "PENDING", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"):
+                active_by_video[video_stem] = {
+                    "run_id": r.run_id,
+                    "life_cycle_state": life,
+                    "start_time": r.start_time,
+                }
+    except Exception as e:
+        log.warning(f"_get_active_ingest_runs failed: {e}")
+        return None  # unknown — not cached, so the next call retries
+
+    _active_runs_cache["runs"] = active_by_video
+    _active_runs_cache["expires_at"] = now + 30
+    return dict(active_by_video)
+
+
+def _run_failure_detail(run_id: str) -> Optional[str]:
+    """Fetch failure detail for a run when it's TERMINATED/INTERNAL_ERROR with non-SUCCESS result_state.
+
+    Fetches runs/get for task runs, then runs/get-output per task run, and returns the first ~500 chars
+    of error + error_trace. Caches per run_id once terminal to avoid refetching.
+
+    Returns None on any exception (logs warning).
+    """
+    # Check cache first
+    if run_id in _failure_detail_cache:
+        return _failure_detail_cache[run_id]
+
+    from databricks.sdk import WorkspaceClient
+    try:
+        w = WorkspaceClient()
+        resp = w.api_client.do("GET", f"/api/2.1/jobs/runs/get?run_id={run_id}")
+        if not str(resp.get("run_name") or "").startswith("vlmwb_"):
+            return None  # never surface another job's error trace
+        state = resp.get("state", {}) or {}
+        life = state.get("life_cycle_state")
+        result_state = state.get("result_state")
+
+        if life not in ("TERMINATED", "INTERNAL_ERROR", "SKIPPED"):
+            return None  # still running — don't cache, the run may fail later
+        if result_state != "SUCCESS":
+            # runs/get lists the per-task runs under `tasks`; get-output needs those ids
+            for task_run in resp.get("tasks") or []:
+                try:
+                    tr_id = task_run.get("run_id")
+                    if not tr_id:
+                        continue
+                    output = w.api_client.do("GET", f"/api/2.1/jobs/runs/get-output?run_id={tr_id}")
+                    error = output.get("error") or ""
+                    error_trace = output.get("error_trace") or ""
+                    detail = (error + "\n" + error_trace).strip()[:500]
+                    if detail:
+                        _failure_detail_cache[run_id] = detail
+                        return detail
+                except Exception:
+                    continue
+        # Terminal with no extractable detail (or succeeded): cache the miss.
+        _failure_detail_cache[run_id] = None
+        return None
+    except Exception as e:
+        log.warning(f"_run_failure_detail({run_id}) failed: {e}")
+        return None
+
+
 @app.get("/api/runs/active")
 def list_runs():
     """Recent workbench-submitted runs (active + finished in the last 24h).
@@ -492,6 +587,7 @@ def list_runs():
             s = r.state
             life = (s.life_cycle_state.value if s and s.life_cycle_state else "") or ""
             res = (s.result_state.value if s and s.result_state else "") or ""
+            failed = life in ("TERMINATED", "INTERNAL_ERROR", "SKIPPED") and res not in ("", "SUCCESS")
             out.append({
                 "run_id": r.run_id,
                 "name": name,
@@ -499,6 +595,7 @@ def list_runs():
                 "life_cycle_state": life,
                 "result_state": res,
                 "state_message": (s.state_message if s else None),
+                "error_detail": _run_failure_detail(r.run_id) if failed else None,
                 "start_time": r.start_time,
                 "end_time": r.end_time,
                 "run_url": f"{host}/#job/runs/{r.run_id}" if host else None,
@@ -506,6 +603,29 @@ def list_runs():
     except Exception as e:
         log.warning(f"list_runs failed: {e}")
     return {"runs": out, "fetched_at": int(time.time() * 1000)}
+
+
+class CancelRunRequest(BaseModel):
+    databricks_run_id: int
+
+
+@app.post("/api/jobs/runs/cancel")
+def cancel_run(req: CancelRunRequest):
+    """Cancel a Databricks job run. Only allows canceling runs whose run_name
+    starts with 'vlmwb_' (workbench-submitted runs)."""
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+    try:
+        run = w.jobs.get_run(req.databricks_run_id)
+        run_name = run.run_name or ""
+        if not run_name.startswith("vlmwb_"):
+            raise HTTPException(403, f"Cannot cancel run '{run_name}' — not a vlmwb_ run")
+        w.jobs.cancel_run(req.databricks_run_id)
+        return {"ok": True, "databricks_run_id": req.databricks_run_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"cancel run failed: {e}")
 
 
 @app.get("/api/health")
@@ -518,6 +638,7 @@ def health():
         "volume_path": VOLUME_PATH,
         "extracted_frames_dir": EXTRACTED_FRAMES_DIR,
         "eval_frames_dir": EVAL_FRAMES_DIR,
+        "mlflow_experiment_path": MLFLOW_EXPERIMENT_PATH,
     }
 
 
@@ -665,7 +786,7 @@ def store_hf_token(req: HFTokenIn):
                 "queue": {"enabled": True},
             }
             host = (os.environ.get("DATABRICKS_HOST") or "").rstrip("/")
-            run = w.api_client.do("POST", "/api/2.2/jobs/runs/submit", body=body)
+            run = w.api_client.do("POST", "/api/2.1/jobs/runs/submit", body=body)
             run_id = run.get("run_id") if isinstance(run, dict) else None
             out["models_run_id"] = run_id
             out["models_run_url"] = f"{host}/#job/runs/{run_id}" if run_id and host else None
@@ -861,6 +982,7 @@ def setup_check():
         if not _lakebase_available():
             raise RuntimeError("DATABRICKS_CLIENT_ID/SECRET not set — app SP can't mint a Postgres token")
         _ensure_labels_table()
+        _ensure_studio_tables()
         with _pg_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM frame_labels")
             n_labels = cur.fetchone()[0]
@@ -1313,6 +1435,7 @@ def list_frames(video: Optional[str] = None, source: str = "eval"):
         if video and video_dir_name != video and video_dir_name != video.replace(".mp4", ""):
             continue
         video_dir_path = str(top["path"] or os.path.join(EXTRACTED_FRAMES_DIR, video_dir_name))
+        # Scan top-level directory (v1 ingests)
         for entry in _ls_dir(video_dir_path):
             name = entry["name"]
             if not name or entry["is_directory"]:
@@ -1325,6 +1448,20 @@ def list_frames(video: Optional[str] = None, source: str = "eval"):
                 timestamp_s=_parse_timestamp(name),
                 video=video_dir_name,
             ))
+        # v2 ingests keep every gated candidate under candidates/; only the
+        # sidecar's `selected` picks belong in the list (same as the index path).
+        try:
+            sidecar = json.loads(_download_bytes(os.path.join(video_dir_path, "candidates.json")))
+            for c in sidecar.get("candidates", []):
+                if c.get("selected"):
+                    out.append(FrameEntry(
+                        name=c["frame_name"],
+                        path=c["frame_path"],
+                        timestamp_s=c.get("timestamp_s"),
+                        video=video_dir_name,
+                    ))
+        except Exception:
+            pass  # no sidecar → pre-v2 layout, top-level scan above is the whole set
     out.sort(key=lambda f: (f.video or "", f.name))
     return out
 
@@ -1982,6 +2119,7 @@ def get_local_run_status(run_id: str, databricks_run_id: str):
         "model_name": None,
         "successful": None,
         "n_frames": None,
+        "error_detail": None,
     }
     if life == "TERMINATED" and result_state == "SUCCESS":
         results_path = f"{LOCAL_RUNS_DIR}/{run_id}/results.json"
@@ -1995,6 +2133,8 @@ def get_local_run_status(run_id: str, databricks_run_id: str):
             out["results_path"] = results_path
         except Exception as e:
             out["state_message"] = f"results parse error: {e}"
+    elif life in ("TERMINATED", "INTERNAL_ERROR", "SKIPPED") and result_state != "SUCCESS":
+        out["error_detail"] = _run_failure_detail(int(databricks_run_id))
     return out
 
 
@@ -2228,15 +2368,10 @@ def _query_finetune_labels(
             clauses.append("fl.frame_path = ANY(%s)")
             params.append(snapshot_frame_paths)
         if video_names:
-            # Frames track their source video via the videos JOIN — frame_path
-            # contains the video name as a path segment, so a LIKE pattern is
-            # the simplest cross-platform match without restructuring the schema.
-            # Build N ORs explicitly so each pattern is parameterized.
-            like_clauses = []
-            for v in video_names:
-                like_clauses.append("fl.frame_path LIKE %s")
-                params.append(f"%/{v}/%")
-            clauses.append("(" + " OR ".join(like_clauses) + ")")
+            # Join on videos table to match by name, avoiding _ and % as wildcards
+            # The UI sends stems (FrameEntry.video); accept full names too.
+            clauses.append("(v.name = ANY(%s) OR regexp_replace(v.name, '\\.[^.]*$', '') = ANY(%s))")
+            params.extend([video_names, video_names])
         if labeled_since:
             clauses.append("fl.created_at >= %s::timestamptz")
             params.append(labeled_since)
@@ -2244,7 +2379,8 @@ def _query_finetune_labels(
         cur.execute(
             f"SELECT fl.frame_path, fl.instrument, fl.anatomy, fl.tissue_condition "
             f"FROM frame_labels fl "
-            f"INNER JOIN extracted_frames_index efi ON efi.frame_path = fl.frame_path"
+            f"INNER JOIN extracted_frames_index efi ON efi.frame_path = fl.frame_path "
+            f"INNER JOIN videos v ON v.id = efi.video_id "
             f"{where} "
             f"ORDER BY fl.created_at",
             tuple(params),
@@ -2356,9 +2492,11 @@ def kick_off_finetune(req: FineTuneRequest):
     Returns immediately with run_id; the Train UI polls for status."""
     import yaml
 
-    if not _lakebase_available():
-        raise HTTPException(503, "Lakebase not configured — fine-tune needs the labels table")
-    _ensure_labels_table()
+    # Only require Lakebase if using lakebase as data source
+    if req.data_source == "lakebase" and not _lakebase_available():
+        raise HTTPException(503, "Lakebase not configured — set data_source='delta' to read from a Delta table instead")
+    if req.data_source == "lakebase":
+        _ensure_labels_table()
 
     # Resolve base model snapshot dir from its manifest
     manifest_path = f"{LOCAL_MODELS_DIR}/{req.base_model_name}/manifest.yaml"
@@ -2497,6 +2635,7 @@ def get_finetune_status(run_id: str, databricks_run_id: str):
         "state_message": state.get("state_message"),
         "run_page_url": resp.get("run_page_url"),
         "result": None,
+        "error_detail": None,
     }
     if life == "TERMINATED" and result_state == "SUCCESS":
         result_path = f"{FINETUNE_RUNS_DIR}/{run_id}/result.json"
@@ -2505,6 +2644,8 @@ def get_finetune_status(run_id: str, databricks_run_id: str):
             out["result"] = json.loads(data.decode("utf-8", errors="replace"))
         except Exception as e:
             out["state_message"] = f"result parse error: {e}"
+    elif life in ("TERMINATED", "INTERNAL_ERROR", "SKIPPED") and result_state != "SUCCESS":
+        out["error_detail"] = _run_failure_detail(int(databricks_run_id))
     return out
 
 
@@ -2714,6 +2855,10 @@ def create_serving_endpoint(req: DeployRequest):
     immediately; poll /api/deploy/endpoints/{name} until state=READY."""
     import re
     from databricks.sdk import WorkspaceClient
+
+    # Validate model name format to prevent injection
+    model_name = _safe_uc_name(req.model_full_name)
+
     mlflow_client = None
     try:
         import mlflow
@@ -2729,7 +2874,7 @@ def create_serving_endpoint(req: DeployRequest):
     else:
         try:
             vlist = mlflow_client.search_model_versions(
-                filter_string=f"name='{req.model_full_name}'", max_results=20,
+                filter_string=f"name='{model_name}'", max_results=20,
             )
             if not vlist:
                 raise HTTPException(404, f"no versions found for {req.model_full_name}")
@@ -2743,7 +2888,7 @@ def create_serving_endpoint(req: DeployRequest):
     if req.endpoint_name:
         name = req.endpoint_name
     else:
-        short = req.model_full_name.rsplit(".", 1)[-1]
+        short = model_name.rsplit(".", 1)[-1]
         name = re.sub(r"[^a-z0-9-]+", "-", short.lower()).strip("-")[:48] + f"-{int(time.time())}"
     name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:63]
 
@@ -2752,7 +2897,7 @@ def create_serving_endpoint(req: DeployRequest):
         "config": {
             "served_entities": [{
                 "name": name + "-srv",
-                "entity_name": req.model_full_name,
+                "entity_name": model_name,
                 "entity_version": str(version),
                 "workload_size": req.workload_size,
                 "workload_type": req.workload_type,
@@ -2764,7 +2909,7 @@ def create_serving_endpoint(req: DeployRequest):
         },
         "tags": [
             {"key": DEPLOY_TAG_KEY, "value": "true"},
-            {"key": "vlmwb_source_model", "value": req.model_full_name},
+            {"key": "vlmwb_source_model", "value": model_name},
             {"key": "vlmwb_source_version", "value": str(version)},
         ],
     }
@@ -2821,6 +2966,9 @@ def repin_model_requirements(req: RepinRequest):
     merged-model dir on disk) that runs ``mlflow.transformers.log_model``
     with the right requirements + bumps the UC model version. Returns
     immediately; the new version then deploys cleanly."""
+    # Validate model name format to prevent injection
+    model_name = _safe_uc_name(req.model_full_name)
+
     notebook_path = _resolve_repin_notebook()
 
     # Pull the source model's artifact dir from its MLflow run, since that's
@@ -2831,13 +2979,13 @@ def repin_model_requirements(req: RepinRequest):
         mlflow.set_registry_uri("databricks-uc")
         client = mlflow.tracking.MlflowClient()
         if req.version:
-            mv = client.get_model_version(req.model_full_name, req.version)
+            mv = client.get_model_version(model_name, req.version)
         else:
             vlist = client.search_model_versions(
-                filter_string=f"name='{req.model_full_name}'", max_results=20,
+                filter_string=f"name='{model_name}'", max_results=20,
             )
             if not vlist:
-                raise HTTPException(404, f"no versions for {req.model_full_name}")
+                raise HTTPException(404, f"no versions for {model_name}")
             mv = max(vlist, key=lambda v: int(v.version))
         run = client.get_run(mv.run_id) if mv.run_id else None
         # Find the merged-dir path from the original run's params/metadata
@@ -2867,12 +3015,12 @@ def repin_model_requirements(req: RepinRequest):
             "pip pinning automatically."
         )
 
-    run_id = f"repin_{int(time.time())}_{req.model_full_name.split('.')[-1][:16]}"
+    run_id = f"repin_{int(time.time())}_{model_name.split('.')[-1][:16]}"
     out_dir = f"{FINETUNE_RUNS_DIR}/{run_id}"
     import yaml
     cfg = {
         "run_id": run_id,
-        "uc_full_name": req.model_full_name,
+        "uc_full_name": model_name,
         "merged_dir": merged_dir,
         "output_dir": out_dir,
         "mlflow_experiment": MLFLOW_EXPERIMENT_PATH,
@@ -3156,9 +3304,12 @@ def kick_off_optimize(req: OptimizeRequest):
 
     cfg: Dict[str, object] = {
         "output_dir": out_dir,
-        # Workspace-specific knobs the bundled notebook reads via _cfg.get(...)
+        # Workspace-specific knobs the bundled notebook reads via _cfg.get(...) — required by notebooks
         "hf_secret_scope": HF_SECRET_SCOPE,
         "hf_secret_key": HF_SECRET_KEY,
+        "local_models_dir": LOCAL_MODELS_DIR,
+        "uc_catalog": UC_CATALOG,
+        "uc_schema": UC_SCHEMA,
         "task": {
             "name": run_id,
             "description": "Prompt optimization for arthroscopy instrument ID",
@@ -3299,6 +3450,7 @@ def get_optimize_status(run_id: str, databricks_run_id: str):
         "best_prompt": None,
         "score": None,
         "history": None,
+        "error_detail": None,
     }
 
     if life == "TERMINATED" and result_state == "SUCCESS":
@@ -3324,8 +3476,14 @@ def get_optimize_status(run_id: str, databricks_run_id: str):
             try:
                 data = _download_bytes(run_path)
                 obj = json.loads(data.decode("utf-8", errors="replace"))
-                out["score"] = obj.get("best_score") or obj.get("optimized_full_score") or obj.get("optimized_full_eval_score")
+                # Read best_score_optim first (GEPA), then fallback to other keys
+                out["score"] = next((obj[k] for k in ("best_score_optim", "best_score",
+                                                      "optimized_full_score", "optimized_full_eval_score")
+                                     if obj.get(k) is not None), None)
                 out["history"] = [h.get("score") for h in obj.get("history", [])] if obj.get("history") else None
+                # Expose round_scores if present in result file
+                if "round_scores" in obj:
+                    out["round_scores"] = obj.get("round_scores")
                 out["run_path"] = run_path
                 break
             except Exception:
@@ -3351,6 +3509,8 @@ def get_optimize_status(run_id: str, databricks_run_id: str):
             )
             if prompt_info:
                 out["registered_prompt"] = prompt_info
+    elif life in ("TERMINATED", "INTERNAL_ERROR", "SKIPPED") and result_state != "SUCCESS":
+        out["error_detail"] = _run_failure_detail(int(databricks_run_id))
 
     return out
 
@@ -3591,6 +3751,30 @@ def list_labels(frame_paths: Optional[str] = None, limit: int = 500):
     return [_row_to_label(r) for r in rows]
 
 
+class LabelsQueryRequest(BaseModel):
+    frame_paths: List[str]
+
+
+@app.post("/api/labels/query")
+def query_labels(req: LabelsQueryRequest):
+    """Query labels for a list of frame paths. Returns labels in the same
+    format as GET /api/labels. Accepts a POST request to handle large
+    path lists without URL length limits."""
+    if not _lakebase_available():
+        return []
+    if not req.frame_paths:
+        return []
+    _ensure_labels_table()
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT frame_path, instrument, anatomy, tissue_condition, notes, source, labeled_by, created_at, updated_at "
+            "FROM frame_labels WHERE frame_path = ANY(%s)",
+            (req.frame_paths,),
+        )
+        rows = cur.fetchall()
+    return [_row_to_label(r) for r in rows]
+
+
 @app.post("/api/labels")
 def upsert_label(body: FrameLabelIn):
     if not _lakebase_available():
@@ -3641,35 +3825,39 @@ def upsert_labels_batch(body: FrameLabelsBatchIn):
     _ensure_labels_table()
     labeled_by = os.environ.get("DATABRICKS_USER_EMAIL") or _ws_user_email() or "vlm-workbench"
     out = []
-    with _pg_conn() as conn, conn.cursor() as cur:
-        for r in body.rows:
-            _check_allowed_path(r.frame_path)
-            if not r.instrument.strip():
-                continue
-            cur.execute(
-                """
-                INSERT INTO frame_labels (frame_path, instrument, anatomy, tissue_condition, notes, source, labeled_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (frame_path) DO UPDATE SET
-                    instrument = EXCLUDED.instrument,
-                    anatomy = EXCLUDED.anatomy,
-                    tissue_condition = EXCLUDED.tissue_condition,
-                    notes = EXCLUDED.notes,
-                    source = EXCLUDED.source,
-                    labeled_by = EXCLUDED.labeled_by,
-                    updated_at = now()
-                RETURNING frame_path, instrument, anatomy, tissue_condition, notes, source, labeled_by, created_at, updated_at
-                """,
-                (
-                    r.frame_path, r.instrument.strip(),
-                    (r.anatomy or "").strip() or None,
-                    (r.tissue_condition or "").strip() or None,
-                    (r.notes or "").strip() or None,
-                    r.source,
-                    labeled_by,
-                ),
-            )
-            out.append(_row_to_label(cur.fetchone()))
+    # Use transaction to ensure all-or-nothing semantics
+    import psycopg
+    with _pg_conn() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                for r in body.rows:
+                    _check_allowed_path(r.frame_path)
+                    if not r.instrument.strip():
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO frame_labels (frame_path, instrument, anatomy, tissue_condition, notes, source, labeled_by)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (frame_path) DO UPDATE SET
+                            instrument = EXCLUDED.instrument,
+                            anatomy = EXCLUDED.anatomy,
+                            tissue_condition = EXCLUDED.tissue_condition,
+                            notes = EXCLUDED.notes,
+                            source = EXCLUDED.source,
+                            labeled_by = EXCLUDED.labeled_by,
+                            updated_at = now()
+                        RETURNING frame_path, instrument, anatomy, tissue_condition, notes, source, labeled_by, created_at, updated_at
+                        """,
+                        (
+                            r.frame_path, r.instrument.strip(),
+                            (r.anatomy or "").strip() or None,
+                            (r.tissue_condition or "").strip() or None,
+                            (r.notes or "").strip() or None,
+                            r.source,
+                            labeled_by,
+                        ),
+                    )
+                    out.append(_row_to_label(cur.fetchone()))
     return {"inserted": len(out), "rows": out}
 
 
@@ -3917,11 +4105,6 @@ class _mlflow_auth_scope:
             os.environ["DATABRICKS_TOKEN"] = self._saved_token
 
 
-def _prime_mlflow_auth():
-    """Deprecated alias — kept for the existing call sites until they migrate."""
-    pass
-
-
 def _register_genai_prompt(template: str, commit_message: str,
                            tags: Optional[Dict[str, str]] = None) -> Optional[Dict[str, object]]:
     """Register a new version of the workbench's prompt. Returns
@@ -4086,6 +4269,10 @@ def _ensure_ingest_tables():
         cur.execute("""
             ALTER TABLE videos ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'video'
         """)
+        # Add md5 column for duplicate detection
+        cur.execute("""
+            ALTER TABLE videos ADD COLUMN IF NOT EXISTS md5 text
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS extracted_frames_index (
                 frame_path   text PRIMARY KEY,
@@ -4120,6 +4307,45 @@ def _ensure_ingest_tables():
         ):
             cur.execute(ddl)
     _INGEST_TABLES_READY = True
+
+
+_STUDIO_TABLES_READY = False
+
+
+def _ensure_studio_tables():
+    """Lazily create the Studio cache tables (video_analyses and audio_transcripts)
+    for storing analysis results and transcriptions in Lakebase."""
+    global _STUDIO_TABLES_READY
+    if _STUDIO_TABLES_READY:
+        return
+    if not _lakebase_available():
+        raise RuntimeError("Lakebase not available for Studio tables")
+    with _pg_conn() as conn, conn.cursor() as cur:
+        # video_analyses: cached LLM analysis results per video
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS video_analyses (
+                video_name       text PRIMARY KEY,
+                duration_s       double precision,
+                n_frames         int,
+                per_frame_model  text,
+                validator_model  text,
+                payload          jsonb,
+                elapsed_s        double precision,
+                cached_at        timestamptz NOT NULL DEFAULT now()
+            )
+        """)
+        # audio_transcripts: cached audio transcription results per video
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audio_transcripts (
+                video_name       text PRIMARY KEY,
+                endpoint         text,
+                text             text,
+                segments         jsonb,
+                raw_response     jsonb,
+                cached_at        timestamptz NOT NULL DEFAULT now()
+            )
+        """)
+    _STUDIO_TABLES_READY = True
 
 
 def _resolve_ingest_notebook() -> str:
@@ -4248,6 +4474,59 @@ def _list_image_batches() -> List[Dict[str, object]]:
     return out
 
 
+def _resolve_video_path(video_name: str) -> str:
+    """Resolve the absolute path for a video.
+
+    Tries in order:
+      1. Lakebase videos table (single source of truth for ingested videos)
+      2. videos/inbox/<name> (pending ingest)
+      3. <VOLUME_PATH>/<name> (legacy root-level videos)
+    Rejects names with path separators or .. for safety."""
+    if "/" in video_name or ".." in video_name:
+        raise HTTPException(400, "Invalid video name")
+
+    w = _workspace()
+
+    # 1. Try Lakebase videos table first (most authoritative for ingested videos)
+    if _lakebase_available():
+        try:
+            _ensure_ingest_tables()
+            with _pg_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT path FROM videos WHERE name = %s", (video_name,))
+                row = cur.fetchone()
+                if row:
+                    path = str(row[0])
+                    # Verify path exists
+                    try:
+                        meta = w.files.get_metadata(path)
+                        if meta and not getattr(meta, "is_directory", False):
+                            return path
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.info(f"_resolve_video_path: videos table lookup failed: {e}")
+
+    # 2. Fall back to inbox directory (pending ingest)
+    inbox_path = os.path.join(VIDEOS_INBOX_DIR, video_name)
+    try:
+        meta = w.files.get_metadata(inbox_path)
+        if meta and not getattr(meta, "is_directory", False):
+            return inbox_path
+    except Exception:
+        pass
+
+    # 3. Fall back to volume root (legacy)
+    root_path = os.path.join(VOLUME_PATH, video_name)
+    try:
+        meta = w.files.get_metadata(root_path)
+        if meta and not getattr(meta, "is_directory", False):
+            return root_path
+    except Exception:
+        pass
+
+    raise HTTPException(404, f"Video not found: {video_name}")
+
+
 class IngestRequest(BaseModel):
     video_name: Optional[str] = None  # if None, ingest every new video in inbox
     candidate_fps: float = 1.0
@@ -4275,7 +4554,29 @@ def list_ingest_videos():
         merged = inbox_videos + inbox_images
         return {"videos": [{**v, "status": "pending", "id": None, "n_frames_extracted": None} for v in merged]}
     _ensure_ingest_tables()
+
+    # Watchdog: mark queued/processing rows as error if >20 min with no active run
+    active_runs = _get_active_ingest_runs()
+    now = time.time()
     with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id::text, name, status, updated_at FROM videos
+            WHERE status IN ('queued', 'processing')
+        """)
+        # Jobs API unreadable → can't tell stuck from running; skip this pass.
+        stuck_rows = cur.fetchall() if active_runs is not None else []
+        for video_id, name, status, updated_at in stuck_rows:
+            if updated_at:
+                elapsed_secs = now - updated_at.timestamp()
+                video_stem = os.path.splitext(name)[0]
+                has_active_run = video_stem in active_runs
+                if elapsed_secs > 20 * 60 and not has_active_run:
+                    # Stuck for >20 min with no active run
+                    cur.execute(
+                        "UPDATE videos SET status='error', status_message=%s, updated_at=now() WHERE id=%s",
+                        (f"ingest stuck for {int(elapsed_secs)}s ({int(elapsed_secs/60)}min) with no active run", video_id)
+                    )
+
         cur.execute("""
             SELECT id::text, name, path, kind, size_bytes, duration_s, status,
                    status_message, n_frames_extracted, created_at, updated_at
@@ -4328,10 +4629,13 @@ async def library_upload(
     file: UploadFile = File(...),
 ):
     """Stream a single file into the appropriate Volume inbox.
+    Streams in 64 KB chunks with md5 computation and size cap.
     For image batches, all files in a batch must use the same `batch_name`
     so they land in the same subfolder.
     Multi-file uploads from the browser issue this endpoint once per file."""
+    import hashlib
     from databricks.sdk import WorkspaceClient
+
     fname = _safe_basename(file.filename or "upload")
     ext = os.path.splitext(fname)[1].lower()
     if kind == "video":
@@ -4349,22 +4653,107 @@ async def library_upload(
     else:
         raise HTTPException(400, f"kind must be 'video' or 'image_batch', got {kind!r}")
 
-    w = WorkspaceClient()
-    try:
-        w.files.create_directory(dest_dir)
-    except Exception:
-        pass  # already exists
+    # Don't overwrite a video an ingest job is reading right now: in flight if
+    # recently updated, or if its run is still active (long ingests don't touch
+    # the row mid-run; an unreadable Jobs API counts as "maybe active").
+    if kind == "video" and _lakebase_available():
+        busy = None
+        try:
+            _ensure_ingest_tables()
+            with _pg_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT status, updated_at > now() - interval '20 minutes' FROM videos "
+                            "WHERE name = %s AND status IN ('queued', 'processing')", (fname,))
+                row = cur.fetchone()
+            if row:
+                recent = bool(row[1])
+                active = _get_active_ingest_runs()
+                if recent or active is None or os.path.splitext(fname)[0] in active:
+                    busy = row[0]
+        except Exception as e:
+            log.warning(f"upload in-flight check failed (non-fatal): {e}")
+        if busy:
+            raise HTTPException(409, f"'{fname}' is being ingested ({busy}); upload again when it finishes")
 
+    # Spool to a temp file in 64 KB chunks (never the whole file in RAM),
+    # enforcing the size cap and hashing as we go.
+    max_bytes = int(os.environ.get("UPLOAD_MAX_BYTES", 2 * 1024 * 1024 * 1024))  # 2 GB default
+    md5_hash = hashlib.md5()
+    total_size = 0
     dest_path = f"{dest_dir}/{fname}"
-    body = await file.read()
-    if not body:
-        raise HTTPException(400, "empty upload")
-    try:
-        w.files.upload(dest_path, body, overwrite=True)
-    except Exception as e:
-        log.exception("upload failed")
-        raise HTTPException(500, f"upload failed: {e}")
-    return {"path": dest_path, "size_bytes": len(body), "kind": kind}
+    with tempfile.TemporaryFile() as spool:
+        while True:
+            chunk = await file.read(64 * 1024)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > max_bytes:
+                raise HTTPException(413, f"File exceeds maximum size of {max_bytes / 1e9:.1f} GB")
+            md5_hash.update(chunk)
+            spool.write(chunk)
+        if total_size == 0:
+            raise HTTPException(400, "empty upload")
+        spool.seek(0)
+
+        w = WorkspaceClient()
+        try:
+            w.files.create_directory(dest_dir)
+        except Exception:
+            pass  # already exists
+        try:
+            w.files.upload(dest_path, spool, overwrite=True)
+        except Exception as e:
+            log.exception("upload failed")
+            raise HTTPException(500, f"upload failed: {e}")
+
+    computed_md5 = md5_hash.hexdigest()
+
+    # Videos: record the hash on a 'pending' row (the ingest upsert later moves
+    # it to 'queued') and warn — never block — if another ready video matches.
+    duplicate_of = None
+    if kind == "video" and _lakebase_available():
+        try:
+            _ensure_ingest_tables()
+            with _pg_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name FROM videos WHERE md5 = %s AND status = 'ready' AND name <> %s LIMIT 1",
+                    (computed_md5, fname),
+                )
+                row = cur.fetchone()
+                duplicate_of = row[0] if row else None
+                cur.execute("SELECT md5 FROM videos WHERE name = %s", (fname,))
+                prev = cur.fetchone()
+                cur.execute("""
+                    INSERT INTO videos (name, path, size_bytes, md5, status)
+                    VALUES (%s, %s, %s, %s, 'pending')
+                    ON CONFLICT (name) DO UPDATE SET
+                        path = EXCLUDED.path, size_bytes = EXCLUDED.size_bytes,
+                        -- New bytes under an existing name: its frames are stale
+                        -- until re-ingested, so put it back in the pending queue.
+                        status = CASE WHEN videos.md5 IS DISTINCT FROM EXCLUDED.md5
+                                      THEN 'pending' ELSE videos.status END,
+                        status_message = CASE WHEN videos.md5 IS DISTINCT FROM EXCLUDED.md5
+                                      THEN 're-uploaded with different content; re-ingest to refresh frames'
+                                      ELSE videos.status_message END,
+                        md5 = EXCLUDED.md5, updated_at = now()
+                """, (fname, dest_path, total_size, computed_md5))
+            if prev and prev[0] != computed_md5:
+                # Different bytes under the same name: drop Studio results cached by name.
+                _ensure_studio_tables()
+                with _pg_conn() as conn, conn.cursor() as cur:
+                    cur.execute("DELETE FROM video_analyses WHERE video_name = %s", (fname,))
+                    cur.execute("DELETE FROM audio_transcripts WHERE video_name = %s", (fname,))
+        except Exception as e:
+            log.warning(f"upload md5 registration failed (non-fatal): {e}")
+
+    response = {
+        "path": dest_path,
+        "size_bytes": total_size,
+        "kind": kind,
+        "md5": computed_md5,
+    }
+    if duplicate_of:
+        response["duplicate_of"] = duplicate_of
+    return response
 
 
 @app.post("/api/videos/ingest", response_model=IngestResponse)
@@ -4389,6 +4778,37 @@ def kick_off_ingest(req: IngestRequest):
 
     submitted: List[Dict[str, object]] = []
     skipped: List[Dict[str, object]] = []
+
+    # Guard: prevent force=True while video is queued/processing with active run.
+    # Single-video requests get a 409; "ingest all" skips the in-flight ones.
+    blocked: Dict[str, str] = {}
+    if req.force:
+        active_runs = _get_active_ingest_runs()
+        with _pg_conn() as conn, conn.cursor() as cur:
+            for tgt in targets:
+                name = tgt["name"]
+                video_stem = os.path.splitext(name)[0]
+                cur.execute(
+                    "SELECT status, updated_at FROM videos WHERE name = %s",
+                    (name,)
+                )
+                row = cur.fetchone()
+                if row:
+                    status, updated_at = row
+                    if status in ("queued", "processing"):
+                        # Check if row was recently updated OR has active run
+                        updated_secs_ago = (time.time() - updated_at.timestamp()) if updated_at else 0
+                        # Jobs API unreadable → assume it may still be running (fail closed)
+                        has_active_run = active_runs is None or video_stem in active_runs
+                        if updated_secs_ago < 20 * 60 or has_active_run:
+                            blocked[name] = (
+                                f"Cannot force re-ingest: video '{name}' is {status} "
+                                f"(updated {int(updated_secs_ago)}s ago"
+                                + (" with active run" if has_active_run else "")
+                                + "). Wait for the current ingest to finish."
+                            )
+        if req.video_name and req.video_name in blocked:
+            raise HTTPException(409, blocked[req.video_name])
 
     # Mint a fresh Lakebase token to hand to the notebook so it can connect
     # back to Postgres as the SP. (The notebook's exec context doesn't share
@@ -4417,9 +4837,45 @@ def kick_off_ingest(req: IngestRequest):
 
     notebook_path = _resolve_ingest_notebook()
     w = _workspace()
+    active_runs = _get_active_ingest_runs() if not req.force else {}
+    now = time.time()
 
     for tgt in targets:
         name = tgt["name"]
+        video_stem = os.path.splitext(name)[0]
+
+        # Check for duplicate submit: if video is already queued/processing and recently updated,
+        # return existing status without resetting the row or submitting a second job
+        if not req.force:
+            try:
+                with _pg_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id::text, status, updated_at FROM videos WHERE name = %s",
+                        (name,)
+                    )
+                    existing = cur.fetchone()
+                    if existing:
+                        existing_id, existing_status, updated_at = existing
+                        if existing_status in ("queued", "processing"):
+                            updated_secs_ago = (now - updated_at.timestamp()) if updated_at else 0
+                            # Jobs API unreadable → assume it may still be running (fail closed)
+                            has_active_run = active_runs is None or video_stem in active_runs
+                            if updated_secs_ago < 20 * 60 or has_active_run:
+                                # Already submitted recently — don't reset the row or submit again
+                                blocked[name] = (
+                                    f"Video '{name}' is already {existing_status} "
+                                    f"(updated {int(updated_secs_ago)}s ago"
+                                    + (" with active run" if has_active_run else "")
+                                    + ")."
+                                )
+            except Exception as e:
+                log.warning(f"duplicate submit check failed (non-fatal): {e}")
+        if name in blocked:
+            if req.video_name:
+                raise HTTPException(409, blocked[name])
+            skipped.append({"name": name, "reason": blocked[name]})
+            continue
+
         with _pg_conn() as conn, conn.cursor() as cur:
             # Reserve a videos row (or reuse existing) — we need a stable
             # video_id BEFORE submitting the job so the notebook can update
@@ -4436,11 +4892,22 @@ def kick_off_ingest(req: IngestRequest):
                     END,
                     status_message = NULL,
                     updated_at = now()
+                -- Atomic in-flight guard: a row another request queued in the
+                -- last 20 min is left alone and RETURNING yields nothing.
+                WHERE NOT (videos.status IN ('queued', 'processing')
+                           AND videos.updated_at > now() - interval '20 minutes')
                 RETURNING id::text, status
             """, (name, tgt["path"], tgt["size_bytes"],
                   os.environ.get("DATABRICKS_USER_EMAIL") or "vlm-workbench",
                   bool(req.force)))
-            video_id, status = cur.fetchone()
+            reserved = cur.fetchone()
+        if reserved is None:
+            msg = f"Video '{name}' was just queued by another request."
+            if req.video_name:
+                raise HTTPException(409, msg)
+            skipped.append({"name": name, "reason": msg})
+            continue
+        video_id, status = reserved
 
         if status == "ready" and not req.force:
             skipped.append({"name": name, "reason": "already ingested", "video_id": video_id})
@@ -4507,7 +4974,15 @@ def kick_off_ingest(req: IngestRequest):
             "queue": {"enabled": True},
             "environments": [{
                 "environment_key": "cpu_env",
-                "spec": {"environment_version": "5"},
+                # Declare deps on the serverless env so the PLATFORM builds
+                # them before the notebook starts. The notebook has NO
+                # in-notebook `%pip install`/`%restart_python` — that step
+                # spiked driver memory and OOM-killed the job. numpy/pillow/
+                # pyyaml come from the base image.
+                "spec": {
+                    "environment_version": "5",
+                    "dependencies": ["decord", "opencv-python-headless", "psycopg[binary]"],
+                },
             }],
             "performance_target": "PERFORMANCE_OPTIMIZED",
         }
@@ -4733,57 +5208,160 @@ def delete_video_index(video_id: str):
 
 # ── Video streaming (Volume → range-supported HTTP) ─────────────────────
 
+import hashlib
+import shutil
+import threading
+
+# Per-replica disk cache so Range requests (every seek in the player) read a
+# local file instead of re-downloading the whole video from the Volume.
+# LRU by mtime (touched on every hit), bounded by file count and total bytes.
+_VIDEO_CACHE_DIR = "/tmp/vlmwb_video_cache"
+_VIDEO_CACHE_MAX_FILES = 2
+_VIDEO_CACHE_MAX_BYTES = 2 * 1024 ** 3
+_video_cache_lock = threading.Lock()  # guards eviction + the per-key lock table
+_video_cache_key_locks: Dict[str, threading.Lock] = {}
+
+
+def _video_cache_key(abs_path: str, size: int, last_modified: str) -> str:
+    """Path + size + last-modified, so a replaced file under the same name
+    (even one of identical size) never serves the old footage."""
+    return hashlib.sha256(f"{abs_path}\0{size}\0{last_modified}".encode()).hexdigest()[:16]
+
+
+def _evict_video_cache(keep: str) -> None:
+    """Drop least-recently-used entries until within the file/byte limits.
+    `keep` (the file being served) is never evicted; unlinking a file another
+    request is still streaming is safe on POSIX (its open fd stays valid)."""
+    with _video_cache_lock:
+        entries = []
+        for name in os.listdir(_VIDEO_CACHE_DIR):
+            path = os.path.join(_VIDEO_CACHE_DIR, name)
+            if path == keep:
+                continue
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            if name.endswith(".part"):
+                if time.time() - st.st_mtime > 3600:  # orphaned by a crashed download
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                continue
+            entries.append((st.st_mtime, path, st.st_size))
+        entries.sort()  # oldest first
+        count = len(entries) + 1
+        total = sum(e[2] for e in entries) + (os.path.getsize(keep) if os.path.exists(keep) else 0)
+        for _, path, size in entries:
+            if count <= _VIDEO_CACHE_MAX_FILES and total <= _VIDEO_CACHE_MAX_BYTES:
+                break
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            lock = _video_cache_key_locks.get(os.path.basename(path))
+            if lock is not None and not lock.locked():
+                _video_cache_key_locks.pop(os.path.basename(path), None)
+            count -= 1
+            total -= size
+
+
+def _open_cached_video(abs_path: str, size: int, last_modified: str):
+    """Open file handle on a local copy of the full video. Downloads it once
+    per replica, streamed to disk in 1 MB chunks and renamed into place, so
+    memory stays flat regardless of video size. The handle is opened BEFORE
+    eviction runs, so a concurrent request evicting this entry can't pull the
+    file out from under the response (POSIX keeps an open file readable)."""
+    os.makedirs(_VIDEO_CACHE_DIR, exist_ok=True)
+    key = _video_cache_key(abs_path, size, last_modified)
+    dest = os.path.join(_VIDEO_CACHE_DIR, key)
+    with _video_cache_lock:
+        key_lock = _video_cache_key_locks.setdefault(key, threading.Lock())
+    with key_lock:
+        if not os.path.exists(dest):
+            tmp = f"{dest}.{threading.get_ident()}.part"
+            contents = _workspace().files.download(abs_path).contents
+            try:
+                with open(tmp, "wb") as f:
+                    if hasattr(contents, "read"):
+                        shutil.copyfileobj(contents, f, 1024 * 1024)
+                    else:
+                        f.write(bytes(contents))
+                os.replace(tmp, dest)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+        os.utime(dest)  # LRU touch
+        handle = open(dest, "rb")
+    _evict_video_cache(keep=dest)
+    return handle
+
+
+def _iter_file_range(f, start: int, length: int, chunk: int = 1024 * 1024):
+    try:
+        f.seek(start)
+        remaining = length
+        while remaining > 0:
+            buf = f.read(min(chunk, remaining))
+            if not buf:
+                break
+            remaining -= len(buf)
+            yield buf
+    finally:
+        f.close()
+
+
 @app.get("/api/videos/{video_name}/stream")
 def stream_video(video_name: str, request: Request):
-    """Stream a video from the Volume with HTTP range support so the browser
-    can seek without downloading the whole file."""
-    if "/" in video_name or ".." in video_name:
-        raise HTTPException(400, "Invalid video name")
-    abs_path = os.path.join(VOLUME_PATH, video_name)
+    """Stream a video from the Volume with HTTP Range support.
+
+    Every request (ranged or not) is served from the per-replica disk cache
+    (`_cached_video_file`) in 1 MB chunks — no whole-file reads into memory."""
+    abs_path = _resolve_video_path(video_name)
     _check_allowed_path(abs_path)
 
-    # Get full size via metadata
     w = _workspace()
     try:
         meta = w.files.get_metadata(abs_path)
         size = int(getattr(meta, "content_length", 0) or 0)
     except Exception as e:
         raise HTTPException(404, f"Video not found: {e}")
+    if size <= 0:
+        raise HTTPException(404, "Video is empty")
     # Force video/mp4 for .mp4 files — Files API metadata returns
     # application/octet-stream which browsers refuse to play.
     ctype = "video/mp4" if video_name.lower().endswith(".mp4") else (
         getattr(meta, "content_type", None) or "application/octet-stream"
     )
 
-    range_header = request.headers.get("range") or request.headers.get("Range")
-    start, end = 0, size - 1 if size else None
-    if range_header and size:
-        m = re.match(r"bytes=(\d+)-(\d*)", range_header)
-        if m:
-            start = int(m.group(1))
-            end = int(m.group(2)) if m.group(2) else size - 1
-    chunk_len = (end - start + 1) if size else None
+    start, end, ranged = 0, size - 1, False
+    range_header = request.headers.get("range")
+    if range_header:
+        m = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:  # suffix range: the last N bytes
+                start = max(size - int(m.group(2)), 0)
+            if start > end or start >= size:
+                raise HTTPException(416, detail="range not satisfiable",
+                                    headers={"Content-Range": f"bytes */{size}"})
+            ranged = True
 
-    # Files API doesn't support partial reads directly via download(), so we
-    # download the whole file but only return the requested byte range.
-    # For typical 50-100MB videos this is fine on the app's network.
-    data = _download_bytes(abs_path)
-    if size and (start > 0 or end != size - 1):
-        body = data[start:end + 1]
-        status = 206
-        headers = {
-            "Content-Range": f"bytes {start}-{end}/{size}",
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(len(body)),
-        }
-    else:
-        body = data
-        status = 200
-        headers = {
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(len(body)),
-        }
-    return Response(content=body, status_code=status, media_type=ctype, headers=headers)
+    try:
+        handle = _open_cached_video(abs_path, size, str(getattr(meta, "last_modified", "") or ""))
+    except Exception as e:
+        log.exception("stream_video download failed")
+        raise HTTPException(502, f"could not read video: {e}")
+
+    length = end - start + 1
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(length)}
+    if ranged:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return StreamingResponse(_iter_file_range(handle, start, length),
+                             status_code=206 if ranged else 200, media_type=ctype, headers=headers)
 
 
 # ── Studio: visual analysis pipeline ─────────────────────────────────────
@@ -4832,6 +5410,7 @@ def _read_cache(video_name: str) -> Optional[dict]:
     # 1. Lakebase
     if _lakebase_available():
         try:
+            _ensure_studio_tables()
             with _pg_conn() as conn, conn.cursor() as cur:
                 cur.execute("SELECT payload FROM video_analyses WHERE video_name = %s", (video_name,))
                 row = cur.fetchone()
@@ -4853,6 +5432,7 @@ def _write_cache(video_name: str, payload: dict) -> str:
     # 1. Lakebase
     if _lakebase_available():
         try:
+            _ensure_studio_tables()
             with _pg_conn() as conn, conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO video_analyses (video_name, duration_s, n_frames,
@@ -4897,6 +5477,7 @@ def _read_audio_cache(video_name: str) -> Optional[dict]:
     if not _lakebase_available():
         return None
     try:
+        _ensure_studio_tables()
         with _pg_conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT endpoint, text, segments, raw_response, cached_at "
@@ -4924,6 +5505,7 @@ def _write_audio_cache(video_name: str, endpoint: str, text: Optional[str],
     if not _lakebase_available():
         return
     try:
+        _ensure_studio_tables()
         with _pg_conn() as conn, conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO audio_transcripts (video_name, endpoint, text, segments, raw_response)
@@ -4944,24 +5526,57 @@ def _write_audio_cache(video_name: str, endpoint: str, text: Optional[str],
 
 
 def _gather_frames_for_video(video_name: str, max_frames: int) -> List[Dict[str, str]]:
-    """Pick frames for a video from the existing extracted_frames/ cache.
-    Returns a list of {name, path, timestamp_s, b64} ordered by timestamp.
-    """
-    base = video_name.replace(".mp4", "")
-    video_dir = os.path.join(EXTRACTED_FRAMES_DIR, base)
-    out: List[Dict[str, str]] = []
-    for entry in _ls_dir(video_dir):
-        name = entry["name"]
-        if not name or entry["is_directory"] or not name.lower().endswith(".jpg"):
-            continue
-        ts = _parse_timestamp(name) or 0.0
-        out.append({"name": name, "path": str(entry["path"] or os.path.join(video_dir, name)), "timestamp_s": ts})
+    """Pick up to `max_frames` of a video's *selected* key frames, ordered by
+    timestamp, as {name, path, timestamp_s, b64}.
+
+    Sources, in order: the Lakebase `extracted_frames_index`; the ingest
+    sidecar `extracted_frames/<stem>/candidates.json` (selected entries); a
+    raw scan of the frames folder (v1 layout top-level JPGs, else v2
+    `candidates/`) for videos ingested before either existed."""
+    from pathlib import Path
+    stem = Path(video_name).stem
+    out: List[Dict[str, object]] = []
+
+    if _lakebase_available():
+        try:
+            _ensure_ingest_tables()
+            with _pg_conn() as conn, conn.cursor() as cur:
+                cur.execute("""
+                    SELECT efi.frame_path, efi.frame_name, efi.timestamp_s
+                    FROM extracted_frames_index efi
+                    JOIN videos v ON v.id = efi.video_id
+                    WHERE v.name = %s AND efi.selected
+                    ORDER BY efi.timestamp_s
+                """, (video_name,))
+                out = [{"name": r[1], "path": r[0], "timestamp_s": float(r[2] or 0.0)}
+                       for r in cur.fetchall()]
+        except Exception as e:
+            log.warning(f"_gather_frames_for_video index lookup failed, falling back: {e}")
+
+    video_dir = os.path.join(EXTRACTED_FRAMES_DIR, stem)
+    if not out:
+        try:
+            sidecar = json.loads(_download_bytes(os.path.join(video_dir, "candidates.json")))
+            out = [{"name": c["frame_name"], "path": c["frame_path"],
+                    "timestamp_s": float(c.get("timestamp_s") or 0.0)}
+                   for c in sidecar.get("candidates", []) if c.get("selected")]
+        except Exception:
+            pass  # no sidecar (pre-v2 ingest) — scan the folder below
+
+    if not out:
+        def _jpgs(d: str) -> List[Dict[str, object]]:
+            return [{"name": e["name"], "path": str(e["path"] or os.path.join(d, e["name"])),
+                     "timestamp_s": _parse_timestamp(e["name"]) or 0.0}
+                    for e in _ls_dir(d)
+                    if e["name"] and not e["is_directory"] and e["name"].lower().endswith(".jpg")]
+        # v1 ingests wrote only the picks at top level; a v2 candidates/ folder
+        # without a sidecar is unfiltered, so it's the last resort.
+        out = _jpgs(video_dir) or _jpgs(os.path.join(video_dir, "candidates"))
+
     out.sort(key=lambda f: float(f["timestamp_s"]))
     if len(out) > max_frames:
-        # Even-stride downsample
-        stride = len(out) / float(max_frames)
+        stride = len(out) / float(max_frames)  # even-stride downsample
         out = [out[int(i * stride)] for i in range(max_frames)]
-    # Pre-encode all frames once
     for f in out:
         try:
             f["b64"] = _load_b64(f["path"])
@@ -5008,6 +5623,7 @@ def _per_frame_call_with_prompt(model_name: str, frame_b64: str, frame_name: str
                 ],
             }],
             max_tokens=400, temperature=0,
+            timeout=60,  # Per-call timeout so one slow call can't hang the request
         )
         text = resp.choices[0].message.content or ""
         return {"frame": frame_name, "ok": True, "raw": text, "parsed": _parse_strict_json(text),
@@ -5103,6 +5719,7 @@ def _validator_call(model_name: str, per_frame_results: List[dict], duration_s: 
                 {"role": "user", "content": VALIDATOR_PROMPT + "\n\n" + payload},
             ],
             max_tokens=2000, temperature=0,
+            timeout=60,  # Per-call timeout so one slow call can't hang the request
         )
         text = resp.choices[0].message.content or ""
         return {"ok": True, "raw": text, "parsed": _parse_strict_json(text),
@@ -5135,15 +5752,16 @@ async def studio_analyze(req: StudioAnalyzeRequest):
             return cached
 
     t_start = time.time()
-    # Step 1: gather frames
+    # Step 1: gather frames (cap at 30 regardless of req.max_frames)
     log.info(f"[studio] gathering frames for {req.video_name}")
-    frames = _gather_frames_for_video(req.video_name, req.max_frames)
+    max_frames_capped = min(30, req.max_frames)
+    frames = _gather_frames_for_video(req.video_name, max_frames_capped)
     if not frames:
         raise HTTPException(404,
             f"No extracted frames for '{req.video_name}'. Run notebook 13 to extract first.")
     duration_s = max(float(f["timestamp_s"]) for f in frames)
 
-    # Step 2: per-frame VLM in parallel
+    # Step 2: per-frame VLM in parallel with explicit per-call timeout
     log.info(f"[studio] {len(frames)} frames × {per_frame_model}")
     loop = asyncio.get_running_loop()
     with ThreadPoolExecutor(max_workers=min(16, len(frames))) as pool:
@@ -5319,7 +5937,7 @@ def _score_studio_with_mlflow(
 
 # ── Studio: audio transcription ──────────────────────────────────────────
 
-def _extract_audio_to_wav(video_bytes: bytes, target_sr: int = 16000) -> bytes:
+def _extract_audio_to_wav(video_src, target_sr: int = 16000) -> bytes:
     """Decode the audio track of an MP4 (or any container PyAV reads) and
     re-encode as a 16-bit mono WAV at `target_sr` Hz. Returns the WAV bytes.
 
@@ -5329,7 +5947,8 @@ def _extract_audio_to_wav(video_bytes: bytes, target_sr: int = 16000) -> bytes:
     """
     import av
     import wave
-    in_buf = io.BytesIO(video_bytes)
+    # bytes, or an open binary file (the stream cache) — PyAV reads either
+    in_buf = io.BytesIO(video_src) if isinstance(video_src, (bytes, bytearray)) else video_src
     container = av.open(in_buf)
     audio_stream = next((s for s in container.streams if s.type == "audio"), None)
     if audio_stream is None:
@@ -5421,10 +6040,14 @@ def studio_audio_transcribe(req: dict):
         if cached:
             return cached
 
-    abs_path = os.path.join(VOLUME_PATH, video_name)
+    abs_path = _resolve_video_path(video_name)
     _check_allowed_path(abs_path)
+    # Decode from the per-replica disk cache shared with /stream, so a large
+    # video is never held in App memory.
     try:
-        video_bytes = _download_bytes(abs_path)
+        meta = _workspace().files.get_metadata(abs_path)
+        size = int(getattr(meta, "content_length", 0) or 0)
+        video_file = _open_cached_video(abs_path, size, str(getattr(meta, "last_modified", "") or ""))
     except Exception as e:
         raise HTTPException(404, f"Video not found: {e}")
 
@@ -5432,7 +6055,8 @@ def studio_audio_transcribe(req: dict):
     # input. The 16MB serving-endpoint request limit makes sending the raw
     # MP4 infeasible for typical surgery videos.
     try:
-        wav_bytes = _extract_audio_to_wav(video_bytes)
+        with video_file:
+            wav_bytes = _extract_audio_to_wav(video_file)
     except RuntimeError as e:
         if "no audio stream" in str(e).lower():
             payload = {
@@ -5449,7 +6073,7 @@ def studio_audio_transcribe(req: dict):
         raise HTTPException(500, f"Audio extraction failed: {e}")
     except Exception as e:
         raise HTTPException(500, f"Audio extraction failed: {e}")
-    log.info(f"audio extract: video={len(video_bytes)/1e6:.1f}MB → wav={len(wav_bytes)/1e6:.1f}MB")
+    log.info(f"audio extract: video={size/1e6:.1f}MB → wav={len(wav_bytes)/1e6:.1f}MB")
 
     audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
     w = _workspace()

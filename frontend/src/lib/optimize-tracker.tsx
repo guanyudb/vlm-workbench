@@ -1,5 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
 import { api } from "@/api";
+import { usePolling } from "@/lib/use-polling";
 
 export interface OptimizeJob {
   run_id: string;
@@ -83,13 +84,10 @@ export function OptimizeTrackerProvider({ children }: { children: React.ReactNod
   // Background poller — runs while there's at least one in-flight job. Resilient
   // to transient errors (502/network blips): keeps polling unless the same run
   // errors >5 times in a row.
-  useEffect(() => {
-    const running = jobs.filter((j) => j.state === "running");
-    if (running.length === 0) return;
-
-    let stopped = false;
-    const poll = async () => {
-      if (stopped) return;
+  const hasRunning = jobs.some((j) => j.state === "running");
+  usePolling(
+    async () => {
+      const running = jobs.filter((j) => j.state === "running");
       const updates: Record<string, Partial<OptimizeJob>> = {};
       await Promise.all(running.map(async (j) => {
         try {
@@ -126,7 +124,6 @@ export function OptimizeTrackerProvider({ children }: { children: React.ReactNod
           }
         }
       }));
-      if (stopped) return;
       if (Object.keys(updates).length > 0) {
         setJobs((cur) => {
           const next = cur.map((j) => updates[j.run_id] ? { ...j, ...updates[j.run_id] } : j);
@@ -134,13 +131,10 @@ export function OptimizeTrackerProvider({ children }: { children: React.ReactNod
           return next;
         });
       }
-    };
-    poll();
-    const interval = setInterval(poll, 8000);
-    return () => { stopped = true; clearInterval(interval); };
-    // We re-subscribe whenever the list of running jobs changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobs.filter((j) => j.state === "running").map((j) => j.run_id).join(",")]);
+    },
+    8000,
+    () => !hasRunning
+  );
 
   const value = useMemo<TrackerCtx>(() => ({ jobs, startJob, dismissJob, markNotified }), [jobs, startJob, dismissJob, markNotified]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

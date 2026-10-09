@@ -22,15 +22,18 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger,
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import { useOptimizeTracker } from "@/lib/optimize-tracker";
 import { usePersistentState, setStringCodec, mapStringCodec } from "@/lib/use-persistent-state";
+import { usePolling } from "@/lib/use-polling";
 import { cn } from "@/lib/utils";
+
+// Result rows key frames by basename; selections hold full Volume paths.
+const frameBasename = (p: string) => p.split("/").pop() || p;
 
 type FrameSource = "extracted" | "eval" | "labeled";
 
@@ -188,13 +191,16 @@ export default function Playground({
     startedAt: number;
     finishedAt?: number;
   };
+  // Runs the user stopped: their late poll responses must not resurrect them.
+  const stoppedRunIdsRef = useRef<Set<string>>(new Set());
   const [localRuns, setLocalRuns] = usePersistentState<Record<string, LocalRun>>(
     "vlmwb.pg.localRuns", {},
   );
 
   // On mount, scrub any stale "submitting" entries — they can't be resumed
   // because we never got back a databricks_run_id. Mark them failed so the
-  // UI shows something instead of an indefinite spinner.
+  // UI shows something instead of an indefinite spinner. Also clear transient
+  // run state (runDuration, progress) since these shouldn't survive a reload.
   useEffect(() => {
     setLocalRuns((cur) => {
       let changed = false;
@@ -209,6 +215,10 @@ export default function Playground({
       }
       return changed ? next : cur;
     });
+    // Clear transient run state on mount
+    setRunDuration(null);
+    setProgress(null);
+    setRunError(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -385,16 +395,16 @@ export default function Playground({
   // Background poller for any local-model jobs still running. Tolerates
   // transient errors (proxy 502 etc.) — only marks failed after 8 in a row.
   const localErrCountsRef = useRef<Record<string, number>>({});
-  useEffect(() => {
-    const inflight = Object.values(localRuns).filter((r) => r.state === "running" || r.state === "submitting");
-    if (inflight.length === 0) return;
-    let stopped = false;
-    const tick = async () => {
-      if (stopped) return;
+  const hasInflightLocal = Object.values(localRuns).some((r) => r.state === "running" || r.state === "submitting");
+
+  usePolling(
+    async () => {
+      const inflight = Object.values(localRuns).filter((r) => r.state === "running" || r.state === "submitting");
       await Promise.all(inflight.map(async (r) => {
         if (r.state !== "running") return;
         try {
           const s = await api.localRunStatus(r.runId, r.databricksRunId);
+          if (stoppedRunIdsRef.current.has(r.runId)) return;
           localErrCountsRef.current[r.runId] = 0;
           if (s.life_cycle_state === "TERMINATED" && s.result_state === "SUCCESS") {
             // Fold rows into the results Map. The notebook writes `frame` as
@@ -444,23 +454,19 @@ export default function Playground({
           }
         }
       }));
-    };
-    tick();
-    const interval = setInterval(tick, 8000);
-    return () => { stopped = true; clearInterval(interval); };
-    // re-subscribe whenever the set of inflight run IDs changes
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [Object.values(localRuns).filter((r) => r.state === "running" || r.state === "submitting").map((r) => r.runId).join(",")]);
+    },
+    8000,
+    () => !hasInflightLocal
+  );
 
   // Keep `running` in sync with whether any local GPU job is still in
   // flight. Also handles the refresh-recovery case: if localRuns came back
   // from localStorage with "running" entries, this flips `running` on so
   // the UI shows the spinning indicators and disables the Run button.
   useEffect(() => {
-    const inflight = Object.values(localRuns).some((r) => r.state === "running" || r.state === "submitting");
-    if (inflight && !running) setRunning(true);
-    if (!inflight && running && cancelRef.current === null) setRunning(false);
-  }, [localRuns, running]);
+    if (hasInflightLocal && !running) setRunning(true);
+    if (!hasInflightLocal && running && cancelRef.current === null) setRunning(false);
+  }, [hasInflightLocal, running]);
 
   useEffect(() => {
     setFrames(null);
@@ -615,11 +621,12 @@ export default function Playground({
     // smallest scope we can request.
     const gatewayEntries = Object.entries(gatewayMissing);
     let pendingGateway = gatewayEntries.length;
+    const cancels: Array<() => void> = [];
     if (pendingGateway === 0) {
       cancelRef.current = null;
     }
     for (const [modelName, framesForModel] of gatewayEntries) {
-      api.playgroundRun(
+      const cancel = api.playgroundRun(
         { frame_paths: framesForModel, model_names: [modelName], prompt },
         {
           onResponse: (resp) => {
@@ -637,7 +644,8 @@ export default function Playground({
               for (const r of resp.results) next.delete(`${r.model}::${r.frame}`);
               return next;
             });
-            setProgress((cur) => cur ? { ...cur, done: cur.done + resp.successful } : cur);
+            // Count both successful and failed frames (resp.results.length)
+            setProgress((cur) => cur ? { ...cur, done: cur.done + resp.results.length } : cur);
             setRunDuration(Number(((performance.now() - t0) / 1000).toFixed(2)));
             pendingGateway -= 1;
             if (pendingGateway === 0) cancelRef.current = null;
@@ -657,6 +665,8 @@ export default function Playground({
               }
               return next;
             });
+            // Count failed frames in progress
+            setProgress((cur) => cur ? { ...cur, done: cur.done + framesForModel.length } : cur);
             pendingGateway -= 1;
             if (pendingGateway === 0) cancelRef.current = null;
             const anyLocal = Object.values(localRuns).some((r) => r.state === "running" || r.state === "submitting");
@@ -664,6 +674,12 @@ export default function Playground({
           },
         }
       );
+      cancels.push(cancel);
+    }
+    if (cancels.length > 0) {
+      cancelRef.current = () => {
+        cancels.forEach((c) => c());
+      };
     }
 
     // 2) Local models — submit one GPU job per model, with only that
@@ -706,9 +722,39 @@ export default function Playground({
     });
   };
 
-  const stopRun = () => {
+  const stopRun = async () => {
     cancelRef.current?.();
     cancelRef.current = null;
+
+    // Cancel any running local jobs, and mark them stopped right away so the
+    // poller ignores them (a failed cancel is reported on the run, not hidden).
+    const stopping = Object.values(localRuns).filter((r) => r.state === "running" || r.state === "submitting");
+    for (const run of stopping) stoppedRunIdsRef.current.add(run.runId);
+    const cancelErrors: Record<string, string> = {};
+    for (const run of stopping) {
+      const databricksRunId = parseInt(run.databricksRunId, 10);
+      if (isNaN(databricksRunId)) continue;
+      try {
+        await api.cancelRun(databricksRunId);
+      } catch (e) {
+        cancelErrors[run.modelName] = (e as Error).message;
+      }
+    }
+    if (stopping.length) {
+      setLocalRuns((cur) => {
+        const next = { ...cur };
+        for (const run of stopping) {
+          next[run.modelName] = {
+            ...next[run.modelName], state: "failed", finishedAt: Date.now(),
+            error: cancelErrors[run.modelName]
+              ? `stopped in the UI, but cancelling the job failed: ${cancelErrors[run.modelName]}`
+              : "stopped by user",
+          };
+        }
+        return next;
+      });
+    }
+
     setRunning(false);
     setInFlight(new Set());  // resolve all spinners back to prior result / —
   };
@@ -724,16 +770,27 @@ export default function Playground({
     if (results.size === 0) return;
     // Top vote across results = candidate "best model"
     const counts = new Map<string, number>();
+    const selectedBase = new Set(Array.from(selectedFrames, frameBasename));
     for (const r of results.values()) {
-      if (!r.ok) continue;
+      if (!r.ok || !selectedBase.has(frameBasename(r.frame)) || !allRunModels.includes(r.model)) continue;
       const cls = primaryClass(r.parsed);
       if (cls) {
         counts.set(r.model, (counts.get(r.model) || 0) + 1);
       }
     }
-    const first = allRunModels[0] ?? "";
-    setSaveBestModel(first);
-    setSaveName(`${first.replace(/^databricks-/, "") || "snapshot"} ${new Date().toLocaleString()}`);
+    // Use the model with the highest vote count, or first if no votes
+    let bestModel = allRunModels[0] ?? "";
+    if (counts.size > 0) {
+      let maxVotes = 0;
+      for (const [model, votes] of counts) {
+        if (votes > maxVotes) {
+          maxVotes = votes;
+          bestModel = model;
+        }
+      }
+    }
+    setSaveBestModel(bestModel);
+    setSaveName(`${bestModel.replace(/^databricks-/, "") || "snapshot"} ${new Date().toLocaleString()}`);
     setSaveError(null);
     setSaveSuccess(null);
     setSaveOpen(true);
@@ -744,6 +801,12 @@ export default function Playground({
     setSaving(true);
     setSaveError(null);
     try {
+      // Filter results to selectedFrames × allRunModels. Result rows key frames
+      // by basename while selectedFrames holds full Volume paths.
+      const selectedBase = new Set(Array.from(selectedFrames, frameBasename));
+      const filteredResults = Array.from(results.values()).filter(
+        (r) => selectedBase.has(frameBasename(r.frame)) && allRunModels.includes(r.model)
+      );
       const resp = await api.saveSnapshot({
         name: saveName.trim(),
         frame_paths: Array.from(selectedFrames),
@@ -752,7 +815,7 @@ export default function Playground({
         model_names: allRunModels,
         prompt,
         best_model: saveBestModel || null,
-        results: Array.from(results.values()),
+        results: filteredResults,
         elapsed_s: runDuration ?? undefined,
       });
       setSaveSuccess(resp.id);
@@ -1806,7 +1869,10 @@ function ResultsMatrix({
                       ) : r ? (
                         <ResultCell row={r} goldLabel={gold} />
                       ) : localFailed ? (
-                        <div className="text-[11px] text-destructive" title={local.error}>job failed</div>
+                        <details className="text-[11px] text-destructive">
+                          <summary className="cursor-pointer font-medium">job failed</summary>
+                          <p className="mt-1 max-w-xs whitespace-pre-wrap break-words text-[10px]">{local.error}</p>
+                        </details>
                       ) : (
                         // No result + nothing in flight → this cell was
                         // never run. Dash communicates "not run" without

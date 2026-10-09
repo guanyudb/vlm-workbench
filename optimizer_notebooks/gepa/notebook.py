@@ -246,6 +246,13 @@ print(f"Optimization set: {len(OPTIM_SET)}  holdout: {len(HOLDOUT)}")
 import torch
 from PIL import Image
 
+def _fmapi_bearer(w):
+    """Current bearer token from the SDK's own auth (job/notebook runtime or
+    OAuth). Called before every FMAPI request so long runs never send an
+    expired token — the SDK refreshes it as needed."""
+    return w.config.authenticate()["Authorization"].split(" ", 1)[1]
+
+
 class TaskModel:
     def __init__(self, cfg, modality):
         self.cfg = cfg
@@ -260,11 +267,16 @@ class TaskModel:
 
     def _load_hf(self):
         from transformers import AutoProcessor, AutoModelForImageTextToText, AutoModelForCausalLM, AutoTokenizer
-        # HF token: scope/key configurable via YAML so a different workspace
-        # can ship without editing the notebook source. Defaults preserved for
-        # backwards compatibility with the original deploy.
-        _hf_scope = (_cfg.get("hf_secret_scope") if "_cfg" in dir() else None) or "hls_g4"
-        _hf_key = (_cfg.get("hf_secret_key") if "_cfg" in dir() else None) or "HF_TOKEN"
+        # HF token: scope/key passed via cfg (from app.py YAML config).
+        # No fallback: app must provide hf_secret_scope and hf_secret_key; raise if missing.
+        try:
+            _notebook_cfg = globals().get("_cfg", {}) or {}
+        except Exception:
+            _notebook_cfg = {}
+        _hf_scope = _notebook_cfg.get("hf_secret_scope")
+        _hf_key = _notebook_cfg.get("hf_secret_key")
+        if not _hf_scope or not _hf_key:
+            raise RuntimeError(f"hf_secret_scope and hf_secret_key must be provided in cfg; got scope={_hf_scope}, key={_hf_key}")
         os.environ["HF_TOKEN"] = dbutils.secrets.get(_hf_scope, _hf_key)
         print(f"Loading {self.cfg['model_id']}...")
         if self.modality == "image":
@@ -285,8 +297,8 @@ class TaskModel:
         from openai import OpenAI
         from databricks.sdk import WorkspaceClient
         w = WorkspaceClient()
-        token = w.tokens.create(comment="gepa-task", lifetime_seconds=7200).token_value
-        self.client = OpenAI(api_key=token, base_url=f"{w.config.host}/serving-endpoints")
+        self.w = w  # token re-read per request via _fmapi_bearer
+        self.client = OpenAI(api_key=_fmapi_bearer(w), base_url=f"{w.config.host}/serving-endpoints")
 
     def _load_pil(self, path):
         img = Image.open(path).convert("RGB")
@@ -331,6 +343,7 @@ class TaskModel:
     def _predict_fmapi_image(self, prompt, image_path):
         pil = self._load_pil(image_path)
         b64 = self._b64_pil(pil)
+        self.client.api_key = _fmapi_bearer(self.w)
         resp = self.client.chat.completions.create(
             model=self.cfg["endpoint"],
             messages=[{"role": "user", "content": [
@@ -343,6 +356,7 @@ class TaskModel:
         return resp.choices[0].message.content or ""
 
     def _predict_fmapi_text(self, prompt, text_input):
+        self.client.api_key = _fmapi_bearer(self.w)
         resp = self.client.chat.completions.create(
             model=self.cfg["endpoint"],
             messages=[{"role": "user", "content": f"{prompt}\n\n{text_input}"}],
@@ -378,10 +392,11 @@ class ReflectorModel:
         from openai import OpenAI
         from databricks.sdk import WorkspaceClient
         w = WorkspaceClient()
-        token = w.tokens.create(comment="gepa-reflector", lifetime_seconds=7200).token_value
-        self.client = OpenAI(api_key=token, base_url=f"{w.config.host}/serving-endpoints")
+        self.w = w  # token re-read per request via _fmapi_bearer
+        self.client = OpenAI(api_key=_fmapi_bearer(w), base_url=f"{w.config.host}/serving-endpoints")
 
     def call(self, content_blocks):
+        self.client.api_key = _fmapi_bearer(self.w)
         resp = self.client.chat.completions.create(
             model=self.cfg["endpoint"],
             messages=[{"role": "user", "content": content_blocks}],

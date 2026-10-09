@@ -135,6 +135,7 @@ export interface LocalRunStatus {
   life_cycle_state: string | null;
   result_state: string | null;
   state_message: string | null;
+  error_detail?: string;
   run_page_url: string | null;
   results: RunResultRow[] | null;
   model_name: string | null;
@@ -324,6 +325,19 @@ export function resolvePath(obj: unknown, path: string | undefined): unknown {
   return cur;
 }
 
+
+// AbortSignal.any needs Chrome 116 / Safari 17.4 / Firefox 124; fall back to
+// forwarding aborts by hand on older browsers.
+function anySignal(...signals: AbortSignal[]): AbortSignal {
+  if (typeof (AbortSignal as any).any === "function") return (AbortSignal as any).any(signals);
+  const ctrl = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) { ctrl.abort(); break; }
+    s.addEventListener("abort", () => ctrl.abort(), { once: true });
+  }
+  return ctrl.signal;
+}
+
 export const api = {
   health: () => fetch("/api/health").then(asJson<{
     status: string;
@@ -333,6 +347,7 @@ export const api = {
     volume_path: string;
     extracted_frames_dir: string;
     eval_frames_dir: string;
+    mlflow_experiment_path?: string;
   }>),
 
   getTaskConfig: () => fetch("/api/task-config").then(asJson<TaskConfig>),
@@ -376,6 +391,7 @@ export const api = {
         life_cycle_state: string;
         result_state: string;
         state_message: string | null;
+        error_detail?: string;
         start_time: number;
         end_time: number;
         run_url: string | null;
@@ -404,7 +420,7 @@ export const api = {
     if (batchName) fd.append("batch_name", batchName);
     fd.append("file", file);
     return fetch("/api/library/upload", { method: "POST", body: fd })
-      .then(asJson<{ path: string; size_bytes: number; kind: string }>);
+      .then(asJson<{ path: string; size_bytes: number; kind: string; duplicate_of?: string }>);
   },
 
   videos: () => fetch("/api/videos").then(asJson<VideoEntry[]>),
@@ -436,12 +452,23 @@ export const api = {
       `/api/playground/run/local/${encodeURIComponent(run_id)}?databricks_run_id=${encodeURIComponent(databricks_run_id)}`
     ).then(asJson<LocalRunStatus>),
 
+  cancelRun: (databricks_run_id: number) =>
+    fetch("/api/jobs/runs/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ databricks_run_id }),
+    }).then(asJson<{ ok: boolean; databricks_run_id: number }>),
+
   // ── Labels (ground truth) ────────────────────────────────────────────
   listLabels: (frame_paths?: string[]) => {
-    const q = frame_paths && frame_paths.length
-      ? `?frame_paths=${encodeURIComponent(frame_paths.join(","))}`
-      : "";
-    return fetch(`/api/labels${q}`).then(asJson<FrameLabel[]>);
+    if (frame_paths && frame_paths.length > 0) {
+      return fetch("/api/labels/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ frame_paths }),
+      }).then(asJson<FrameLabel[]>);
+    }
+    return fetch("/api/labels").then(asJson<FrameLabel[]>);
   },
 
   upsertLabel: (body: FrameLabelIn) =>
@@ -546,6 +573,7 @@ export const api = {
         life_cycle_state: string | null;
         result_state: string | null;
         state_message: string | null;
+        error_detail?: string;
         run_page_url: string | null;
         result: {
           run_id: string;
@@ -618,9 +646,6 @@ export const api = {
       workload_size: string;
     }>),
 
-  deployStatus: (name: string) =>
-    fetch(`/api/deploy/endpoints/${encodeURIComponent(name)}`).then(asJson<any>),
-
   deployDelete: (name: string) =>
     fetch(`/api/deploy/endpoints/${encodeURIComponent(name)}`, { method: "DELETE" })
       .then(asJson<{ deleted: string }>),
@@ -687,6 +712,7 @@ export const api = {
       life_cycle_state: string | null;
       result_state: string | null;
       state_message: string | null;
+      error_detail?: string;
       run_page_url: string | null;
       best_prompt: string | null;
       score: number | null;
@@ -716,15 +742,17 @@ export const api = {
       force?: boolean;
     },
     handlers: { onResponse?: (r: StudioAnalysis) => void; onError?: (e: Error) => void },
+    signal?: AbortSignal,
   ): (() => void) => {
     const ctrl = new AbortController();
+    const linkedSignal = signal ? anySignal(ctrl.signal, signal) : ctrl.signal;
     (async () => {
       try {
         const resp = await fetch("/api/studio/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-          signal: ctrl.signal,
+          signal: linkedSignal,
         });
         if (!resp.ok) {
           let detail = resp.statusText;
@@ -747,11 +775,12 @@ export const api = {
       return (await r.json()) as StudioAudioResponse;
     }),
 
-  studioAudioTranscribe: (videoName: string, force = false) =>
+  studioAudioTranscribe: (videoName: string, force = false, signal?: AbortSignal) =>
     fetch("/api/studio/audio/transcribe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ video_name: videoName, force }),
+      signal,
     }).then(async (r) => {
       if (!r.ok) {
         let detail = r.statusText;

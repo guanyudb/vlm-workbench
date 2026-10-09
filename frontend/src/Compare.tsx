@@ -4,31 +4,13 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
-import { api, type RunResultRow, type SnapshotDetail, type SnapshotSummary } from "@/api";
+import { api, type RunResultRow, type SnapshotDetail, type SnapshotSummary, type FrameLabel } from "@/api";
 import { cn } from "@/lib/utils";
-
-function extractInstrument(parsed: any): string {
-  if (!parsed || typeof parsed !== "object") return "?";
-  if (typeof parsed.instrument === "string") {
-    return parsed.instrument.trim() || "no_instrument_visible";
-  }
-  const list = parsed.instruments;
-  if (Array.isArray(list)) {
-    if (list.length === 0) return "no_instrument_visible";
-    if (typeof list[0] === "object") {
-      const c = list[0]?.class;
-      if (typeof c === "string") return c.trim() || "no_instrument_visible";
-    }
-  }
-  return "no_instrument_visible";
-}
+import { extractInstrument } from "@/lib/instruments";
 
 function frameBasename(p: string): string {
   return p.split("/").filter(Boolean).pop() || p;
 }
-
-interface ResultKey { snapId: string; model: string; framePath: string; }
-function rowKey(k: ResultKey): string { return `${k.snapId}::${k.model}::${k.framePath}`; }
 
 export default function Compare() {
   const [summaries, setSummaries] = useState<SnapshotSummary[]>([]);
@@ -38,6 +20,8 @@ export default function Compare() {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [expandedPrompts, setExpandedPrompts] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [hideAgreeing, setHideAgreeing] = useState(false);
+  const [labels, setLabels] = useState<Map<string, FrameLabel>>(new Map());
 
   useEffect(() => {
     setLoadingList(true);
@@ -46,6 +30,43 @@ export default function Compare() {
       .catch((e) => setError(String(e)))
       .finally(() => setLoadingList(false));
   }, []);
+
+  // Compute selectedDetails early so it's available for subsequent effects
+  const selectedDetails = useMemo(() => Array.from(selectedIds)
+    .map((id) => snapshots[id])
+    .filter((d): d is SnapshotDetail => Boolean(d)), [selectedIds, snapshots]);
+
+  // Invalidate detail cache when selection changes
+  useEffect(() => {
+    const toRemove = Object.keys(snapshots).filter((id) => !selectedIds.has(id));
+    if (toRemove.length > 0) {
+      setSnapshots((cur) => {
+        const next = { ...cur };
+        toRemove.forEach((id) => { delete next[id]; });
+        return next;
+      });
+    }
+  }, [selectedIds, snapshots]);
+
+  // Fetch labels for all frames when details are ready
+  useEffect(() => {
+    const allFramePaths = Array.from(selectedDetails.reduce((set, s) => {
+      s.frame_paths.forEach((p) => set.add(p));
+      return set;
+    }, new Set<string>()));
+
+    if (allFramePaths.length > 0) {
+      api.listLabels(allFramePaths)
+        .then((rows) => {
+          const m = new Map<string, FrameLabel>();
+          for (const r of rows) m.set(r.frame_path, r);
+          setLabels(m);
+        })
+        .catch(() => setLabels(new Map()));
+    } else {
+      setLabels(new Map());
+    }
+  }, [selectedDetails]);
 
   const toggleSnapshot = (id: string) => {
     setSelectedIds((cur) => {
@@ -73,10 +94,6 @@ export default function Compare() {
       setLoadingDetail(false);
     }
   };
-
-  const selectedDetails = Array.from(selectedIds)
-    .map((id) => snapshots[id])
-    .filter((d): d is SnapshotDetail => Boolean(d));
 
   // Index results: { snapId -> { framePath -> { model -> row } } }
   const resultIndex = useMemo(() => {
@@ -278,19 +295,47 @@ export default function Compare() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-base">Per-frame predictions</CardTitle>
-              <CardDescription>
-                Showing {commonFrames.length === 0 ? `union of ${allFrames.length} frames (no shared frames)` : `${commonFrames.length} shared frames`}
+              <CardDescription className="flex items-center justify-between">
+                <span>
+                  Showing {commonFrames.length === 0 ? `union of ${allFrames.length} frames (no shared frames)` : `${commonFrames.length} shared frames`}
+                </span>
+                <label className="flex items-center gap-2 text-xs font-normal text-muted-foreground cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={hideAgreeing}
+                    onChange={(e) => setHideAgreeing(e.target.checked)}
+                    className="rounded"
+                  />
+                  Only frames where snapshots disagree
+                </label>
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              {(commonFrames.length === 0 ? allFrames : commonFrames).map((framePath) => (
-                <FrameRow
-                  key={framePath}
-                  framePath={framePath}
-                  snapshots={selectedDetails}
-                  resultIndex={resultIndex}
-                />
-              ))}
+              {(commonFrames.length === 0 ? allFrames : commonFrames)
+                .filter((framePath) => {
+                  if (!hideAgreeing) return true;
+                  const fkey = frameBasename(framePath);
+                  const allBestLabels = selectedDetails.map((snap) => {
+                    // Same choice as FrameRow: best model if it has a row for this frame, else the first model.
+                    const byModel = resultIndex[snap.id]?.[fkey] || {};
+                    const best = snap.best_model && byModel[snap.best_model]
+                      ? snap.best_model
+                      : snap.model_names[0];
+                    const r = best ? (resultIndex[snap.id]?.[fkey]?.[best]) : undefined;
+                    return r?.parsed ? extractInstrument(r.parsed) : "";
+                  });
+                  const allPresent = allBestLabels.every((l) => l);
+                  return allPresent && new Set(allBestLabels).size > 1;
+                })
+                .map((framePath) => (
+                  <FrameRow
+                    key={framePath}
+                    framePath={framePath}
+                    snapshots={selectedDetails}
+                    resultIndex={resultIndex}
+                    goldLabel={labels.get(framePath)}
+                  />
+                ))}
             </CardContent>
           </Card>
         </>
@@ -303,10 +348,12 @@ function FrameRow({
   framePath,
   snapshots,
   resultIndex,
+  goldLabel,
 }: {
   framePath: string;
   snapshots: SnapshotDetail[];
   resultIndex: Record<string, Record<string, Record<string, RunResultRow>>>;
+  goldLabel?: FrameLabel;
 }) {
   // Per snapshot, gather (model, prediction) pairs.
   // resultIndex keys frames by BASENAME (matching the backend's result
@@ -360,6 +407,7 @@ function FrameRow({
                 {rows.map(({ model, row }) => {
                   const label = row?.parsed ? extractInstrument(row.parsed) : (row?.ok ? "?" : "—");
                   const isBest = model === snap.best_model;
+                  const isCorrect = goldLabel?.instrument && label ? label === goldLabel.instrument : null;
                   return (
                     <div key={model} className="flex items-center gap-1.5">
                       <span className={cn("text-[11px]", isBest ? "font-medium" : "text-muted-foreground")}>
@@ -371,6 +419,12 @@ function FrameRow({
                       >
                         {label}
                       </Badge>
+                      {isCorrect === true && (
+                        <span className="text-emerald-600 dark:text-emerald-400" title={`matches gold: ${goldLabel?.instrument}`}>✓</span>
+                      )}
+                      {isCorrect === false && (
+                        <span className="text-destructive" title={`gold: ${goldLabel?.instrument}`}>✗</span>
+                      )}
                     </div>
                   );
                 })}

@@ -215,6 +215,13 @@ print("output:", TASK_OUT)
 
 # COMMAND ----------
 
+def _fmapi_bearer(w):
+    """Current bearer token from the SDK's own auth (job/notebook runtime or
+    OAuth). Called before every FMAPI request so long runs never send an
+    expired token — the SDK refreshes it as needed."""
+    return w.config.authenticate()["Authorization"].split(" ", 1)[1]
+
+
 class TaskLM(dspy.LM):
     """One LM that supports image OR text inputs, HF-local OR Databricks FMAPI."""
 
@@ -235,8 +242,16 @@ class TaskLM(dspy.LM):
     def _load_hf(self):
         from transformers import (AutoProcessor, AutoModelForImageTextToText,
                                   AutoModelForCausalLM, AutoTokenizer)
-        _hf_scope = (_cfg.get("hf_secret_scope") if "_cfg" in dir() else None) or "hls_g4"
-        _hf_key = (_cfg.get("hf_secret_key") if "_cfg" in dir() else None) or "HF_TOKEN"
+        # HF token: scope/key passed via cfg (from app.py YAML config).
+        # No fallback: app must provide hf_secret_scope and hf_secret_key; raise if missing.
+        try:
+            _notebook_cfg = globals().get("_cfg", {}) or {}
+        except Exception:
+            _notebook_cfg = {}
+        _hf_scope = _notebook_cfg.get("hf_secret_scope")
+        _hf_key = _notebook_cfg.get("hf_secret_key")
+        if not _hf_scope or not _hf_key:
+            raise RuntimeError(f"hf_secret_scope and hf_secret_key must be provided in cfg; got scope={_hf_scope}, key={_hf_key}")
         os.environ["HF_TOKEN"] = dbutils.secrets.get(_hf_scope, _hf_key)
         print(f"Loading {self.cfg['model_id']}...")
         if self.modality == "image":
@@ -257,8 +272,8 @@ class TaskLM(dspy.LM):
         from openai import OpenAI
         from databricks.sdk import WorkspaceClient
         w = WorkspaceClient()
-        token = w.tokens.create(comment="dspy-task", lifetime_seconds=7200).token_value
-        self.client = OpenAI(api_key=token, base_url=f"{w.config.host}/serving-endpoints")
+        self.w = w  # token re-read per request via _fmapi_bearer
+        self.client = OpenAI(api_key=_fmapi_bearer(w), base_url=f"{w.config.host}/serving-endpoints")
         self.endpoint = self.cfg["endpoint"]
 
     # ---- helpers ----
@@ -334,6 +349,7 @@ class TaskLM(dspy.LM):
             self._shrink(img).save(buf, format="JPEG", quality=85)
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        self.client.api_key = _fmapi_bearer(self.w)
         resp = self.client.chat.completions.create(
             model=self.endpoint,
             messages=[{"role": "user", "content": content}],
@@ -357,7 +373,8 @@ prompt_lm = None
 if OPTIMIZER["type"] in ("MIPROv2", "COPRO"):
     from databricks.sdk import WorkspaceClient
     w = WorkspaceClient()
-    pm_token = w.tokens.create(comment="dspy-prompt-model", lifetime_seconds=7200).token_value
+    # dspy.LM fixes its api_key at construction; the job-runtime token lasts the run.
+    pm_token = _fmapi_bearer(w)
     pm_endpoint = PROMPT_MODEL["endpoint"]
     pm_base = f"{w.config.host}/serving-endpoints"
     # DSPy can talk to OpenAI-compatible endpoints directly

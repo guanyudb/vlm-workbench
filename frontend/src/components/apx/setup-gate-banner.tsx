@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { AlertTriangle, ChevronRight, X } from "lucide-react";
 import { api } from "@/api";
+import { usePolling } from "@/lib/use-polling";
 
 const DISMISS_KEY = "vlmwb.setup-banner.dismissed";
 
@@ -28,21 +29,23 @@ export function SetupGateBanner({
     try { return sessionStorage.getItem(DISMISS_KEY) === "1"; } catch { return false; }
   });
 
-  useEffect(() => {
-    let alive = true;
-    const fetchOnce = () => {
-      api.setupCheck()
-        .then((r) => {
-          if (!alive) return;
-          setFailing(r.checks.filter((c) => !c.ok).map((c) => c.name));
-        })
-        .catch(() => { /* leave previous state */ })
-        .finally(() => { if (alive) setLoading(false); });
-    };
-    fetchOnce();
-    const t = setInterval(fetchOnce, 60000);
-    return () => { alive = false; clearInterval(t); };
-  }, []);
+  // Poll setup check every 60s, but only while:
+  // - not dismissed
+  // - not on setup tab
+  // - and until the first result arrives, then only while checks are failing
+  const shouldPoll = !dismissed && currentRoute !== "setup" && (loading || failing.length > 0);
+
+  usePolling(
+    async () => {
+      // A failed fetch throws → usePolling backs off and retries; `loading`
+      // only clears once a result arrives, so one 502 can't end polling.
+      const r = await api.setupCheck();
+      setFailing(r.checks.filter((c) => !c.ok).map((c) => c.name));
+      setLoading(false);
+    },
+    60000,
+    () => !shouldPoll
+  );
 
   if (loading || failing.length === 0 || currentRoute === "setup" || dismissed) return null;
 

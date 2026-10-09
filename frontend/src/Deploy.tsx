@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  AlertCircle, CheckCircle2, Cloud, ExternalLink, Loader2, Play, RefreshCcw,
+  AlertCircle, CheckCircle2, Cloud, ExternalLink, Loader2, RefreshCcw,
   Rocket, Trash2, Wand2, XCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -15,7 +15,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { api, type DeployableModel, type ServingEndpointRow } from "@/api";
-import { cn } from "@/lib/utils";
+import { usePolling } from "@/lib/use-polling";
 
 const WORKLOAD_TYPES = [
   { value: "CPU", label: "CPU (cheapest, no GPU)" },
@@ -64,6 +64,8 @@ export default function Deploy() {
   const [workloadSize, setWorkloadSize] = useState<string>("Small");
   const [scaleToZero, setScaleToZero] = useState<boolean>(true);
   const [submitting, setSubmitting] = useState(false);
+  // Track newly deployed endpoint to poll for appearance
+  const [watchingEndpoint, setWatchingEndpoint] = useState<{ name: string; startedAt: number } | null>(null);
 
   const refresh = () => {
     setLoading(true);
@@ -75,17 +77,28 @@ export default function Deploy() {
   useEffect(refresh, []);
 
   // Auto-refresh while any endpoint is updating
-  useEffect(() => {
-    const updating = endpoints.some(
-      (e) => e.config_state === "IN_PROGRESS" || e.state === "NOT_READY"
-    );
-    if (!updating) return;
-    const t = setInterval(() => {
-      api.servingEndpoints().then(setEndpoints).catch(() => {});
-    }, 15000);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [endpoints.map((e) => `${e.name}:${e.state}:${e.config_state}`).join(",")]);
+  const isUpdating = endpoints.some(
+    (e) => e.config_state === "IN_PROGRESS" || e.state === "NOT_READY"
+  );
+  usePolling(
+    () => api.servingEndpoints().then(setEndpoints).catch(() => {}),
+    15000,
+    () => !isUpdating
+  );
+
+  // Watch for newly deployed endpoint for up to 10 minutes
+  const isWatching = watchingEndpoint && (Date.now() - watchingEndpoint.startedAt < 10 * 60 * 1000);
+  const endpointAppeared = watchingEndpoint && endpoints.some((e) => e.name === watchingEndpoint.name);
+  usePolling(
+    async () => {
+      if (endpointAppeared) {
+        setWatchingEndpoint(null);
+      }
+      await api.servingEndpoints().then(setEndpoints).catch(() => {});
+    },
+    5000,  // Poll faster while watching (5s vs 15s)
+    () => !isWatching
+  );
 
   const openDeploy = (m: DeployableModel) => {
     setSelectedModel(m);
@@ -111,6 +124,7 @@ export default function Deploy() {
       });
       setInfo(`Deploying ${r.name} → ${r.model_full_name} v${r.version}. Endpoint will be ready in ~5–15 min; it shows up in Playground's model list once state=READY.`);
       setOpen(false);
+      setWatchingEndpoint({ name: r.name, startedAt: Date.now() });
       refresh();
     } catch (e) {
       setError((e as Error).message);

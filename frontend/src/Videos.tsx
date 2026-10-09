@@ -9,6 +9,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { api, type IngestVideoRow } from "@/api";
 import { cn } from "@/lib/utils";
+import { usePolling } from "@/lib/use-polling";
+import { useConfirm, ConfirmDialog } from "@/lib/use-dialog";
+import { useToast } from "@/lib/toast-context";
 
 // Fallback paths used until /api/health resolves. The deployed workspace's
 // actual volume path comes from env (VOLUME_PATH) via /api/health.
@@ -43,7 +46,11 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 export default function Videos() {
+  const confirmDelete = useConfirm();
+  const { addToast } = useToast();
+
   const [videos, setVideos] = useState<IngestVideoRow[]>([]);
+  const [prevVideos, setPrevVideos] = useState<Map<string, IngestVideoRow>>(new Map());
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [candidateFps, setCandidateFps] = useState<number>(1.0);
@@ -59,14 +66,46 @@ export default function Videos() {
   const videosInboxPath = `${volumePath}/videos/inbox/`;
   const imagesInboxPath = `${volumePath}/images/`;
 
-  const refresh = () => {
+  const refresh = async () => {
     setLoading(true);
-    api.ingestVideos()
-      .then((r) => setVideos(r.videos))
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
+    try {
+      const r = await api.ingestVideos();
+
+      // Track status transitions and emit toasts
+      const prevMap = new Map(prevVideos);
+      const newMap = new Map<string, IngestVideoRow>();
+      for (const video of r.videos) {
+        newMap.set(video.name, video);
+        const prev = prevMap.get(video.name);
+
+        if (prev && prev.status !== video.status) {
+          if (video.status === "ready") {
+            addToast({
+              title: `Video ready: ${video.name}`,
+              description: video.n_frames_extracted ? `${video.n_frames_extracted} frames extracted` : undefined,
+              variant: "success",
+            });
+          } else if (video.status === "error") {
+            addToast({
+              title: `Video ingestion failed: ${video.name}`,
+              description: video.status_message || "Unknown error",
+              variant: "destructive",
+            });
+          }
+        }
+      }
+
+      setVideos(r.videos);
+      setPrevVideos(newMap);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
   };
-  useEffect(refresh, []);
+  useEffect(() => {
+    refresh();
+  }, []);
 
   // Fetch the workspace's volume path once so the Library hints (and any
   // other path callouts) match the deployed workspace's UC layout.
@@ -78,12 +117,8 @@ export default function Videos() {
 
   // Auto-refresh every 10s if anything is in-flight, so the UI follows along
   // with the running ingest jobs without a manual refresh.
-  useEffect(() => {
-    if (!videos.some((v) => v.status === "queued" || v.status === "processing")) return;
-    const t = setInterval(refresh, 10000);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videos.map((v) => v.status).join(",")]);
+  const hasInFlight = videos.some((v) => v.status === "queued" || v.status === "processing");
+  usePolling(refresh, 10000, () => !hasInFlight);
 
   const submitOne = async (row: IngestVideoRow, force = false) => {
     setSubmitting(row.name);
@@ -146,14 +181,26 @@ export default function Videos() {
     }
   };
 
-  const deleteVideo = async (video_id: string, name: string) => {
-    if (!confirm(`Remove '${name}' and its extracted-frames index? (JPGs in the volume are kept.)`)) return;
-    try {
-      await api.deleteIngestVideo(video_id);
-      refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+  const deleteVideo = (video_id: string, name: string) => {
+    confirmDelete.show({
+      title: "Remove video",
+      description: `Remove '${name}' and its extracted-frames index? (JPGs in the volume are kept.)`,
+      okText: "Remove",
+      cancelText: "Cancel",
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          await api.deleteIngestVideo(video_id);
+          addToast({
+            title: "Video removed",
+            variant: "success",
+          });
+          refresh();
+        } catch (e) {
+          setError((e as Error).message);
+        }
+      },
+    });
   };
 
   // Instant re-selection over the persisted v2 candidate pool (no GPU job).
@@ -383,6 +430,15 @@ export default function Videos() {
           )}
         </CardContent>
       </Card>
+
+      {/* Dialogs */}
+      <ConfirmDialog
+        open={confirmDelete.confirmState.open}
+        options={confirmDelete.confirmState.options}
+        onConfirm={confirmDelete.handleConfirm}
+        onCancel={confirmDelete.handleCancel}
+        confirming={confirmDelete.confirming}
+      />
     </div>
   );
 }
@@ -437,6 +493,7 @@ function UploadDropZone({ onUploaded }: { onUploaded: () => void }) {
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<string>("");
   const [err, setErr] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
 
   const handleFiles = async (files: FileList | File[]) => {
     setErr(null);
@@ -457,19 +514,25 @@ function UploadDropZone({ onUploaded }: { onUploaded: () => void }) {
       return;
     }
     setUploading(true);
+    setWarnings([]);
     try {
       let ok = 0, fail = 0;
       const total = arr.length;
+      const newWarnings: string[] = [];
       for (const f of [...videos, ...images]) {
         setProgress(`${ok + fail + 1}/${total} · ${f.name}`);
         try {
-          await api.uploadToLibrary(videoExt.test(f.name) ? "video" : "image_batch", f, batchName.trim() || undefined);
+          const resp = await api.uploadToLibrary(videoExt.test(f.name) ? "video" : "image_batch", f, batchName.trim() || undefined);
+          if (resp.duplicate_of) {
+            newWarnings.push(`${f.name}: duplicate of ${resp.duplicate_of}`);
+          }
           ok += 1;
         } catch (e) {
           fail += 1;
           console.error("upload failed", f.name, e);
         }
       }
+      setWarnings(newWarnings);
       setProgress(`${ok} uploaded${fail ? ` · ${fail} failed` : ""}`);
       onUploaded();
     } finally {
@@ -526,6 +589,14 @@ function UploadDropZone({ onUploaded }: { onUploaded: () => void }) {
           />
         </div>
         {err && <p className="text-xs text-destructive">{err}</p>}
+        {warnings.length > 0 && (
+          <div className="text-xs text-amber-600 dark:text-amber-500">
+            <p className="font-medium mb-1">Duplicate detected:</p>
+            <ul className="list-inside list-disc space-y-0.5">
+              {warnings.map((w, i) => <li key={i}>{w}</li>)}
+            </ul>
+          </div>
+        )}
       </CardContent>
     </Card>
   );

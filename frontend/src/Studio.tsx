@@ -18,45 +18,13 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { extractInstrument, extractEvidence, extractAnatomy } from "@/lib/instruments";
 
 function fmtTime(s: number | null | undefined): string {
   if (s == null || isNaN(s)) return "—";
   const m = Math.floor(s / 60);
   const r = Math.floor(s % 60);
   return `${m}:${String(r).padStart(2, "0")}`;
-}
-
-function extractInstrument(parsed: any): string {
-  if (!parsed || typeof parsed !== "object") return "?";
-  if (typeof parsed.instrument === "string") {
-    return parsed.instrument.trim() || "no_instrument_visible";
-  }
-  const list = parsed.instruments;
-  if (Array.isArray(list)) {
-    if (list.length === 0) return "no_instrument_visible";
-    if (typeof list[0] === "object") {
-      const c = list[0]?.class;
-      if (typeof c === "string") return c.trim() || "no_instrument_visible";
-    }
-  }
-  return "no_instrument_visible";
-}
-function extractEvidence(parsed: any): string {
-  if (!parsed) return "";
-  if (typeof parsed.evidence === "string") return parsed.evidence;
-  const list = parsed.instruments;
-  if (Array.isArray(list) && list.length && typeof list[0] === "object") {
-    return list[0]?.evidence ?? "";
-  }
-  return "";
-}
-function extractAnatomy(parsed: any): string {
-  if (!parsed) return "";
-  return parsed.anatomy || "";
-}
-function extractTissue(parsed: any): string {
-  if (!parsed) return "";
-  return parsed.tissue_condition || "";
 }
 
 /**
@@ -111,8 +79,12 @@ export default function Studio({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const frameRowRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const audioRowRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const cancelRef = useRef<(() => void) | null>(null);
+  const analyzeAbortRef = useRef<AbortController | null>(null);
+  const analyzeTimerRef = useRef<number | null>(null);
+  const transcribeAbortRef = useRef<AbortController | null>(null);
   const lastSpokenFrame = useRef<number | null>(null);
+  const analyzeStartTimeRef = useRef<number | null>(null);
+  const [analyzeElapsed, setAnalyzeElapsed] = useState<number | null>(null);
   const [chosenVoice, setChosenVoice] = useState<SpeechSynthesisVoice | null>(null);
   const ttsSupported = typeof window !== "undefined" && typeof window.speechSynthesis !== "undefined";
   const VOICE_PREFERENCE = [
@@ -134,13 +106,16 @@ export default function Studio({
 
   // Consume incoming snapshot pin
   useEffect(() => {
-    if (initialSnapshotId && onConsumeInitialSnapshot) onConsumeInitialSnapshot();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (initialSnapshotId) {
+      setSnapshotId(initialSnapshotId);
+      onConsumeInitialSnapshot?.();
+    }
+  }, [initialSnapshotId, onConsumeInitialSnapshot]);
 
   // Load cached analysis (auto) + audio (manual)
   useEffect(() => {
     if (!video) return;
+    cancelAnalyze();  // a response for the previous video must not land here
     setAnalysis(null);
     setAudio(null);
     setAnalyzeError(null);
@@ -265,24 +240,88 @@ export default function Studio({
     if (!video || analyzing) return;
     setAnalyzing(true);
     setAnalyzeError(null);
-    cancelRef.current = api.studioAnalyze(
+    setAnalyzeElapsed(null);
+    const abort = new AbortController();
+    analyzeAbortRef.current = abort;
+    analyzeStartTimeRef.current = Date.now();
+
+    // Start elapsed timer
+    const timer = window.setInterval(() => {
+      if (analyzeStartTimeRef.current) {
+        setAnalyzeElapsed(Math.floor((Date.now() - analyzeStartTimeRef.current) / 1000));
+      }
+    }, 100);
+    analyzeTimerRef.current = timer;
+
+    api.studioAnalyze(
       { video_name: video, force, snapshot_id: snapshotId ?? undefined },
       {
-        onResponse: (a) => { setAnalysis(a); setAnalyzing(false); cancelRef.current = null; },
-        onError: (e) => { setAnalyzeError(e.message); setAnalyzing(false); cancelRef.current = null; },
+        onResponse: (a) => {
+          clearInterval(timer);
+          setAnalysis(a);
+          setAnalyzing(false);
+          analyzeAbortRef.current = null;
+          analyzeStartTimeRef.current = null;
+          setAnalyzeElapsed(null);
+        },
+        onError: (e) => {
+          clearInterval(timer);
+          if (e.name !== "AbortError") {
+            setAnalyzeError(e.message);
+          }
+          setAnalyzing(false);
+          analyzeAbortRef.current = null;
+          analyzeStartTimeRef.current = null;
+          setAnalyzeElapsed(null);
+        },
       },
+      abort.signal,
     );
+  };
+
+  // api.studioAnalyze swallows AbortError (neither callback fires), so
+  // cancelling must reset the analyzing state and timer itself.
+  const cancelAnalyze = () => {
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+    if (analyzeTimerRef.current !== null) {
+      clearInterval(analyzeTimerRef.current);
+      analyzeTimerRef.current = null;
+    }
+    analyzeStartTimeRef.current = null;
+    setAnalyzeElapsed(null);
+    setAnalyzing(false);
   };
 
   const triggerAudio = (force = false) => {
     if (!video || audioBusy) return;
     setAudioBusy(true);
     setAudioError(null);
-    api.studioAudioTranscribe(video, force)
+    const abort = new AbortController();
+    transcribeAbortRef.current = abort;
+
+    api.studioAudioTranscribe(video, force, abort.signal)
       .then(setAudio)
-      .catch((e) => setAudioError(e.message))
-      .finally(() => setAudioBusy(false));
+      .catch((e) => {
+        if (e.name !== "AbortError") {
+          setAudioError(e.message);
+        }
+      })
+      .finally(() => {
+        setAudioBusy(false);
+        transcribeAbortRef.current = null;
+      });
   };
+
+  // Note: transcribe cancellation is possible but not exposed in the UI,
+  // as transcription is typically fast. AbortController is still held to allow
+  // future UI enhancements.
+  // const cancelTranscribe = () => {
+  //   if (transcribeAbortRef.current) {
+  //     transcribeAbortRef.current.abort();
+  //     transcribeAbortRef.current = null;
+  //   }
+  // };
 
   // Derived
   const perFrame = analysis?.per_frame ?? [];
@@ -341,6 +380,11 @@ export default function Studio({
               : analysis ? <><Wand2 className="size-4" /> Re-analyze</>
               : <><Wand2 className="size-4" /> Analyze video</>}
           </Button>
+          {analyzing && (
+            <Button variant="destructive" size="sm" onClick={cancelAnalyze} className="gap-2">
+              Cancel
+            </Button>
+          )}
           {analysis && !analyzing && (
             <Button variant="outline" size="sm" onClick={() => triggerAnalyze(true)} title="Bypass cache">
               Force refresh
@@ -375,6 +419,9 @@ export default function Studio({
           )}
 
           <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+            {analyzing && analyzeElapsed != null && (
+              <span className="font-mono tabular-nums">{analyzeElapsed}s</span>
+            )}
             {analysis && (
               <>
                 <Badge variant="secondary" className="font-normal">{analysis.n_frames} frames</Badge>
