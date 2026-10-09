@@ -212,15 +212,30 @@ try:
     _probe = VideoReader(VIDEO_PATH, ctx=cpu(0))
     n_total = len(_probe)
     fps = float(_probe.get_avg_fps())
-    duration_s = n_total / max(fps, 0.001)
+    # True per-frame presentation times. Edited/VFR videos hold stills (title
+    # cards, slides) as long frames, so idx/avg_fps drifts by seconds — which
+    # would misplace Studio seeks and label timestamps.
+    try:
+        PTS = np.asarray(_probe.get_frame_timestamp(np.arange(n_total)), dtype=np.float64)[:, 0]
+        if len(PTS) != n_total or np.any(np.diff(PTS) < 0):
+            raise ValueError("timestamps missing or non-monotonic")
+    except Exception as e:
+        PTS = np.arange(n_total, dtype=np.float64) / max(fps, 0.001)
+        degrade_reasons.append(f"frame timestamps from average fps ({type(e).__name__})")
+    duration_s = float(PTS[-1] + 1.0 / max(fps, 0.001))
     h0, w0 = _probe[0].asnumpy().shape[:2]
     del _probe
+
+    def _ts(i):
+        return float(PTS[int(i)])
     _scale = min(1.0, MAX_SIDE / max(h0, w0))
     Ws, Hs = (int(w0 * _scale) // 2) * 2, (int(h0 * _scale) // 2) * 2  # decoder wants even dims
     vr = VideoReader(VIDEO_PATH, ctx=cpu(0), width=Ws, height=Hs)
 
-    step = max(1, int(fps / CANDIDATE_FPS))
-    indices = list(range(0, n_total, step))
+    # Candidates on a real-time grid (first frame at/after each tick); a still
+    # held across several ticks yields one candidate, not several copies.
+    _grid = np.arange(0.0, duration_s, 1.0 / CANDIDATE_FPS)
+    indices = sorted({int(i) for i in np.searchsorted(PTS, _grid) if i < n_total})
     if MAX_GAP_S is None:
         MAX_GAP_S = float(np.clip(2.0 * duration_s / max(MAX_FRAMES, 1), 10.0, 60.0))
     print(f"[ingest] {n_total} frames @ {fps:.1f}fps = {duration_s:.1f}s "
@@ -268,11 +283,25 @@ try:
     # Determine if mask represents a true scope or near-full-frame image
     full_frame = mask.mean() > 0.90
     M = mask.astype(bool)
-    border = None if full_frame else ~M
+    # The border rule (light flooding the area outside the scope = withdrawal)
+    # only makes sense with a real, stable black vignette. Measure how often the
+    # far border (well outside the scope circle) is lit across the sampled
+    # frames: ~0 for an arthroscope; full-frame laparoscopy with merely darker
+    # edges is lit much more often, and the rule would reject ordinary bright
+    # in-body frames there (56 of 180 on a public laparoscopy clip).
+    far_border = ~cv2.dilate(mask, np.ones((31, 31), np.uint8)).astype(bool)
+    vignette_lit = float((lit_count[far_border] / max(n_mask, 1)).mean()) if far_border.any() else 1.0
+    stable_vignette = vignette_lit <= 0.10
+    border = None if (full_frame or not stable_vignette) else ~M
     if full_frame:
         print(f"[ingest] scope mask covers {M.mean()*100:.0f}% (full-frame fallback)")
+    elif border is None:
+        print(f"[ingest] scope mask covers {M.mean()*100:.0f}% but the border is lit "
+              f"{vignette_lit*100:.0f}% of the time (no stable vignette) → border rule off; "
+              f"zero-shot + colour OOB checks still apply")
     else:
-        print(f"[ingest] scope mask covers {M.mean()*100:.0f}% (border available for OOB check)")
+        print(f"[ingest] scope mask covers {M.mean()*100:.0f}% (vignette lit {vignette_lit*100:.1f}% "
+              f"of the time; border available for OOB check)")
 
     # ---- pass B: re-decode (small), signals per candidate ----
     # Mask-independent OOB detector: a backstop for when the scope-mask border
@@ -413,7 +442,7 @@ try:
 
         candidates.append({
             "frame_index": int(idx),
-            "timestamp_s": float(idx / fps),
+            "timestamp_s": _ts(idx),
             "grad": _grad_of(g, M),
             "contrast": float(v.std()),
             "sharpness": sharp,
@@ -544,10 +573,10 @@ try:
         dense_step = max(1, int(round(fps / 6.0)))
         new_cands = []
         for bt in bound_times:
-            lo = max(0, int((bt - 2.0) * fps))
-            hi = min(n_total - 1, int((bt + 2.0) * fps))
+            lo = max(0, int(np.searchsorted(PTS, bt - 2.0)))
+            hi = min(n_total - 1, int(np.searchsorted(PTS, bt + 2.0)))
             for fi in range(lo, hi + 1, dense_step):
-                ts = fi / fps
+                ts = _ts(fi)
                 if round(ts, 2) in existing:
                     continue
                 try:
@@ -803,7 +832,7 @@ try:
                 # Candidate swap: recompute all signals for the new frame and re-gate
                 try:
                     new_rgb = vr[best_idx].asnumpy()
-                    new_signals = _compute_frame_signals(new_rgb, best_idx, best_idx / fps)
+                    new_signals = _compute_frame_signals(new_rgb, best_idx, _ts(best_idx))
                     if _gate(new_signals) == "ok":
                         # Swap passes gate: update the candidate
                         c.update(new_signals)

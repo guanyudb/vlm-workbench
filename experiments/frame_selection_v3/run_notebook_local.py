@@ -24,6 +24,7 @@ class VideoReader:
     """decord.VideoReader shim over cv2 (index → RGB ndarray, optional resize)."""
 
     def __init__(self, path, ctx=None, width=-1, height=-1):
+        self.path = path
         self.cap = cv2.VideoCapture(path)
         self.n = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 25.0
@@ -46,7 +47,16 @@ class VideoReader:
         return types.SimpleNamespace(asnumpy=lambda: rgb, shape=rgb.shape)
 
     def get_frame_timestamp(self, idx):
-        return np.array([[i / self.fps, (i + 1) / self.fps] for i in np.atleast_1d(idx)])
+        # Real presentation times (VFR-aware), like decord, read once via PyAV.
+        if not hasattr(self, "_pts"):
+            import av
+            with av.open(self.path) as c:
+                st = c.streams.video[0]
+                pts = sorted(float(p.pts * p.time_base) for p in c.demux(st) if p.pts is not None)
+            self._pts = np.array(pts[: self.n] + [pts[-1]] * max(0, self.n - len(pts)))
+        i = np.atleast_1d(idx)
+        nxt = np.append(self._pts[1:], self._pts[-1] + 1 / self.fps)
+        return np.stack([self._pts[i], nxt[i]], 1)
 
 
 decord = types.ModuleType("decord")
@@ -119,6 +129,12 @@ except _Exit as e:
     res = json.loads(e.args[0])
     print("EXIT PAYLOAD:", json.dumps(res, indent=1))
 print("STATUS LOG:", status_log[-2:])
+# Debug aid: every candidate with its gate reason and OOB signals.
+keep = ("timestamp_s", "frame_index", "gate_reason", "oob_zs", "border_lum", "oob_detector_flag")
+json.dump([{k: c.get(k) for k in keep} for c in g.get("candidates", [])],
+          open(os.path.join(out_dir, "candidates_all.json"), "w"))
+print("border_base:", g.get("border_base"), "| full_frame:", g.get("full_frame"),
+      "| mask coverage:", round(float(g["M"].mean()), 3) if "M" in g else None)
 side = json.load(open(os.path.join(out_dir, "candidates.json")))
 sel = [c for c in side["candidates"] if c["selected"]]
 print(f"selected {len(sel)}: " + ", ".join(f"{c['timestamp_s']:.0f}s" for c in sel))
