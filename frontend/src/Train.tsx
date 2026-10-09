@@ -466,7 +466,7 @@ export default function Train() {
                 <Label className="text-[11px] text-muted-foreground">Source videos (comma-separated, optional)</Label>
                 <Input
                   value={filterVideos.join(", ")}
-                  placeholder="e.g. VinayVideoThing1, knee_arthroscopy_03"
+                  placeholder="e.g. knee_arthroscopy_03, lap_chole_01"
                   className="h-8 text-xs"
                   onChange={(e) => setFilterVideos(
                     e.target.value.split(",").map((s) => s.trim()).filter(Boolean)

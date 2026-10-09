@@ -35,3 +35,6 @@ module.env
 
 # Bundled experiments may write Volume paths into local tmp results
 _tmp/
+
+# Local MLflow file store (accidental runs without a tracking URI)
+mlruns/
