@@ -315,7 +315,7 @@ def _grant_pg_privileges():
         try:
             import uuid as _uuid
             resp = w.api_client.do(
-                "POST", "/api/2.0/database/credentials/generate",
+                "POST", "/api/2.0/database/credentials",
                 body={"instance_names": [LB_INSTANCE], "request_id": str(_uuid.uuid4())},
             )
             pg_token = (resp.get("token") if isinstance(resp, dict) else None)

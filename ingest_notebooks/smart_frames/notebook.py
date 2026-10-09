@@ -111,17 +111,33 @@ def _mint_pg_token() -> str:
             if t: return t
         except Exception as e:
             print(f"[ingest] project credential mint failed: {e}")
+    errors = []
     if PG_INSTANCE:
+        # Provisioned instances: POST /api/2.0/database/credentials (the SDK's
+        # generate_database_credential). `/credentials/generate` doesn't exist.
         try:
             import uuid as _uuid
-            r = _sdk.api_client.do("POST", "/api/2.0/database/credentials/generate",
+            r = _sdk.api_client.do("POST", "/api/2.0/database/credentials",
                                    body={"instance_names": [PG_INSTANCE],
                                          "request_id": str(_uuid.uuid4())})
             t = (r or {}).get("token")
             if t: return t
+            errors.append("instance credential API returned no token")
         except Exception as e:
+            errors.append(f"instance credential mint failed: {e}")
             print(f"[ingest] instance credential mint failed: {e}")
-    raise RuntimeError("could not mint Lakebase token (pg_endpoint and pg_instance both unset)")
+    # Last resort: this job identity's own OAuth bearer — the App SP's M2M
+    # token is exactly what the app itself uses as its Postgres password.
+    try:
+        t = _sdk.config.authenticate().get("Authorization", "").split(" ", 1)[-1]
+        if t:
+            print("[ingest] using the job identity's OAuth bearer as the Lakebase password")
+            return t
+    except Exception as e:
+        errors.append(f"SDK bearer unavailable: {e}")
+    if not PG_ENDPOINT and not PG_INSTANCE:
+        errors.insert(0, "pg_endpoint and pg_instance both unset")
+    raise RuntimeError("could not mint Lakebase token (" + "; ".join(errors)[:400] + ")")
 
 # Lakebase tokens expire after ~1 h; a long ingest would fail its final
 # writes with the token minted at start. Re-mint once it's 40 min old.
