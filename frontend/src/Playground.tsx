@@ -476,6 +476,18 @@ export default function Playground({
       .catch((e) => setLoadError(`frames: ${e.message}`));
   }, [frameSource]);
 
+  // Drop selections that aren't in the loaded frame list (e.g. persisted from
+  // another source or an earlier session) so they can't linger in the results
+  // grid or be sent with the next Run.
+  useEffect(() => {
+    if (!frames) return;
+    const present = new Set(frames.map((f) => f.path));
+    setSelectedFrames((prev) => {
+      const next = new Set(Array.from(prev).filter((p) => present.has(p)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [frames]);
+
   // Fetch labels for every loaded frame path so we can render gold-truth
   // chips + accuracy stats. Cheap: a single batched call keyed by paths.
   useEffect(() => {
@@ -566,13 +578,13 @@ export default function Playground({
 
   const startRun = (mode: "missing" | "all" = "missing") => {
     if (running) return;
-    if (selectedFrames.size === 0) return;
+    if (runFrames.length === 0) return;
     if (selectedModels.size === 0 && selectedLocalModels.size === 0) return;
 
     // Delta semantics by default: keep existing results, only run missing
     // (model, frame) cells. mode === "all" forces a re-fetch of every cell
     // (used by the "Re-run all" button).
-    const framePaths = Array.from(selectedFrames);
+    const framePaths = runFrames;
     const isMissing = (m: string, p: string) =>
       mode === "all" || !results.has(`${m}::${p.split("/").pop() || p}`);
     const gatewayMissing: Record<string, string[]> = {};
@@ -831,6 +843,7 @@ export default function Playground({
   const loadSnapshot = async (id: string) => {
     try {
       const s = await api.getSnapshot(id);
+      setVideoFilter("__all__");  // snapshot frames may span videos
       setSelectedFrames(new Set(s.frame_paths));
       // Partition the snapshot's models into AI Gateway vs local. Stuffing
       // local model names into selectedModels would make the next Run
@@ -864,14 +877,23 @@ export default function Playground({
   };
 
   // ── derived for the results matrix ───────────────────────────────────
-  const runFrames = useMemo(() => Array.from(selectedFrames).sort(), [selectedFrames]);
+  // Selected frames that belong to the current video filter — the grid, Run
+  // and the selection count all use this, never frames from another video.
+  const runFrames = useMemo(() => {
+    let sel = Array.from(selectedFrames);
+    if (frames && videoFilter !== "__all__") {
+      const inVideo = new Set(frames.filter((f) => f.video === videoFilter).map((f) => f.path));
+      sel = sel.filter((p) => inVideo.has(p));
+    }
+    return sel.sort();
+  }, [selectedFrames, frames, videoFilter]);
   const runModels = useMemo(
     () => [...Array.from(selectedModels), ...Array.from(selectedLocalModels)].sort(),
     [selectedModels, selectedLocalModels],
   );
   const canRun =
     !running &&
-    selectedFrames.size > 0 &&
+    runFrames.length > 0 &&
     (selectedModels.size > 0 || selectedLocalModels.size > 0);
 
   // The right column carries a wide model-results table that can grow
@@ -890,13 +912,17 @@ export default function Playground({
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-base">Frames</CardTitle>
             <div className="flex items-center gap-2">
-              <Badge variant="secondary">{selectedFrames.size} / {visibleFrames.length} selected</Badge>
+              <Badge variant="secondary">{runFrames.length} / {visibleFrames.length} selected</Badge>
             </div>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="flex flex-col gap-1.5">
               <Label className="text-xs">Source</Label>
-              <Select value={frameSource} onValueChange={(v) => setFrameSource(v as FrameSource)}>
+              <Select value={frameSource} onValueChange={(v) => {
+                setFrameSource(v as FrameSource);
+                setVideoFilter("__all__");     // videos differ per source
+                setSelectedFrames(new Set());  // start empty for the new source
+              }}>
                 <SelectTrigger className="h-8">
                   <SelectValue />
                 </SelectTrigger>
@@ -933,7 +959,10 @@ export default function Playground({
               <Label className="text-xs">Video</Label>
               <Select
                 value={videoFilter}
-                onValueChange={setVideoFilter}
+                onValueChange={(v) => {
+                  setVideoFilter(v);
+                  setSelectedFrames(new Set());  // a new video starts with nothing selected
+                }}
                 disabled={videoOptions.length === 0}
               >
                 <SelectTrigger className="h-8" title={
@@ -1268,7 +1297,7 @@ export default function Playground({
               <Wand2 className="size-4" /> Optimize prompt…
             </Button>
             <span className="ml-auto text-xs text-muted-foreground">
-              {selectedFrames.size} frame(s) × {selectedModels.size} model(s) = {selectedFrames.size * selectedModels.size} call(s)
+              {runFrames.length} frame(s) × {selectedModels.size} model(s) = {runFrames.length * selectedModels.size} call(s)
             </span>
           </CardContent>
         </Card>
