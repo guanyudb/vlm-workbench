@@ -35,7 +35,7 @@ def _load_notebook_detector():
     consts = "\n".join(l.strip() for l in src.splitlines()
                        if re.match(r"\s*(TISSUE_HUE_MIN|NEAR_WHITE_BLUE_MAX|LIT_MIN)\s*=", l))
     start = src.index("    def _is_oob_frame(rgb):")
-    end = src.index("\n    candidates = []", start)
+    end = src.index("\n    # ---- SigLIP2 zero-shot scores", start)
     body = "\n".join(l[4:] for l in src[start:end].splitlines())  # dedent out of the try block
     ns = {"cv2": cv2, "np": np}
     exec(consts + "\n" + body, ns)

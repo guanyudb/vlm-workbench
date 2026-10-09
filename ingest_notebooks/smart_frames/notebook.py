@@ -77,6 +77,7 @@ PG_DBNAME = cfg["pg_dbname"]
 PG_USER = cfg["pg_user"]
 PG_PORT = int(cfg.get("pg_port", 5432))
 CANDIDATE_FPS = float(cfg.get("candidate_fps", 1.0))
+SIGLIP_DIR = cfg.get("siglip_model_dir") or ""  # SigLIP2 vision ONNX + text concepts (optional)
 MAX_FRAMES = int(cfg.get("max_frames", 40))
 MAX_GAP_S = cfg.get("max_gap_seconds")  # None → computed from duration below
 PG_ENDPOINT = cfg.get("pg_endpoint", "")
@@ -307,6 +308,74 @@ try:
         oob_flag = near_white_blue_frac > NEAR_WHITE_BLUE_MAX and tissue_frac < TISSUE_HUE_MIN
         return oob_flag, tissue_frac, edge_density, near_white_blue_frac, brightness_std
 
+    # ---- SigLIP2 zero-shot scores (vision ONNX on CPU; degrades loudly) ----
+    # One CPU pass per candidate gives (a) an embedding for near-duplicate
+    # control, (b) a zero-shot "out of body" vs "inside the body" score for the
+    # privacy gate — it catches title cards (incl. burned-in patient details),
+    # X-ray/CT slides, hands and open-wound skin that the colour heuristic
+    # misses — and (c) instrument-visible / obscured scores for the selector.
+    # Text-side embeddings are precomputed (siglip2_text_concepts.npz).
+    # Calibrated 2026-10-09 (experiments/frame_selection_v3): OOB threshold
+    # -1.0 → 1.7% false rejects on 292 real in-body arthroscopy frames, 100% of
+    # 35 operating-room/equipment images; blind VLM judges preferred v3.1 picks
+    # 17/24 over v1.5 on 6 public CC-BY videos.
+    OOB_ZS_THR = -1.0
+    _sig = None
+    if SIGLIP_DIR:
+        try:
+            import onnxruntime as ort
+            _t = np.load(f"{SIGLIP_DIR}/siglip2_text_concepts.npz")
+            _sig = {"sess": ort.InferenceSession(f"{SIGLIP_DIR}/siglip2_base_vision.onnx",
+                                                 providers=["CPUExecutionProvider"]),
+                    "temb": _t["temb"], "concepts": _t["concepts"],
+                    "scale": float(_t["scale"]), "bias": float(_t["bias"])}
+            print(f"[ingest] SigLIP2 loaded from {SIGLIP_DIR}")
+        except Exception as e:
+            degrade_reasons.append(f"SigLIP2 unavailable — {type(e).__name__}: {str(e)[:150]}")
+            print(f"[ingest][warn] SigLIP2 unavailable → v1.5 selector, heuristic-only OOB gate: {e}")
+    else:
+        degrade_reasons.append("SigLIP2 not configured (no siglip_model_dir)")
+
+    def _sig_prep(rgb):
+        # SigLIP2 image processor: 224x224 bilinear, /255, normalize mean=std=0.5
+        x = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        return ((x - 0.5) / 0.5).transpose(2, 0, 1)
+
+    def _sig_scores(batch):
+        """Prepped (n,3,224,224) → (normalized embeddings, per-frame score dicts).
+        Concept logit = logsumexp of SigLIP logits over that concept's prompts."""
+        emb = _sig["sess"].run(None, {"pixel_values": np.stack(batch)})[0]
+        lg = _sig["scale"] * emb @ _sig["temb"].T + _sig["bias"]
+        def _L(concept):
+            sub = lg[:, _sig["concepts"] == concept]
+            mx = sub.max(1, keepdims=True)
+            return (mx + np.log(np.exp(sub - mx).sum(1, keepdims=True))).ravel()
+        oob, inst, bad = _L("oob") - _L("inbody"), _L("inst") - _L("noinst"), _L("bad") - _L("clear")
+        return emb, [{"oob_zs": float(a), "inst_zs": float(b), "bad_zs": float(c)}
+                     for a, b, c in zip(oob, inst, bad)]
+
+    sig_rows = []   # SigLIP embeddings; candidate c's row is c["sig_row"]
+    _sig_buf = []   # (candidate, prepped tensor) awaiting a batch of 16
+
+    def _sig_flush():
+        global _sig
+        if not _sig_buf or _sig is None:
+            _sig_buf.clear()
+            return
+        try:
+            emb, sc = _sig_scores([t for _, t in _sig_buf])
+        except Exception as e:
+            degrade_reasons.append(f"SigLIP2 inference failed — {type(e).__name__}: {str(e)[:150]}")
+            print(f"[ingest][warn] SigLIP2 inference failed, disabling: {e}")
+            _sig = None
+            _sig_buf.clear()
+            return
+        for (c, _), sco, e in zip(_sig_buf, sc, emb):
+            c.update(sco)
+            c["sig_row"] = len(sig_rows)
+            sig_rows.append(e)
+        _sig_buf.clear()
+
     candidates = []
     for idx in ok_idx:
         try:
@@ -344,6 +413,13 @@ try:
             "brightness_std": float(brightness_std),
             "oob_detector_flag": bool(oob_flag),
         })
+        if _sig is not None:
+            _sig_buf.append((candidates[-1], _sig_prep(rgb)))
+            if len(_sig_buf) >= 16:
+                _sig_flush()
+    _sig_flush()
+    if _sig is not None:
+        print(f"[ingest] SigLIP2: scored {len(sig_rows)}/{len(candidates)} candidates")
     grad_med = float(np.median([c["grad"] for c in candidates]))
     border_base = float(np.median([c["border_lum"] for c in candidates])) if border is not None else 0.0
 
@@ -362,6 +438,9 @@ try:
             return "out-of-body"   # PHI guard: never persisted
         # Mask-independent OOB check: catches frames shot outside body even if mask fails
         if c["oob_detector_flag"]:
+            return "out-of-body"   # PHI guard: never persisted
+        # Zero-shot (SigLIP2) OOB check: title/text cards, X-ray/CT, hands, skin
+        if c.get("oob_zs", -1e9) > OOB_ZS_THR:
             return "out-of-body"   # PHI guard: never persisted
         if c["grad"] < 0.55 * grad_med:
             return "blank"
@@ -487,6 +566,11 @@ try:
                     "brightness_std": float(brightness_std),
                     "oob_detector_flag": bool(oob_flag),
                 }
+                if _sig is not None:
+                    _e, _sc = _sig_scores([_sig_prep(rgb)])
+                    cand.update(_sc[0])
+                    cand["sig_row"] = len(sig_rows)
+                    sig_rows.append(_e[0])
                 if _gate(cand) == "ok":
                     cand["gate_reason"] = "ok"
                     new_cands.append(cand)
@@ -559,7 +643,81 @@ try:
         picked.sort(key=lambda c: c["timestamp_s"])
         return picked, anchor_keys
 
-    selected, anchor_keys = _select(gated, MAX_FRAMES, MAX_GAP_S, duration_s)
+    # ---- v3.1 selector (SigLIP2 utility + MMR diversity) ----
+    def _select_v3(pool, k, y, dur, E, lam=0.6, dup=0.95):
+        """Coverage anchors (>=1 per y-second window, best utility, preferring a
+        non-near-duplicate) + bookends, then MMR fill: utility − lam·(max cosine
+        to picks) under v1.5's relaxing time spacing. The near-duplicate cutoff
+        relaxes last, so static videos still reach k. c["value"] is the utility.
+        Mirrors experiments/frame_selection_v3/selector.py."""
+        pool = sorted(pool, key=lambda c: c["timestamp_s"])
+        n_min = max(1, math.ceil(dur / y))
+        keff = min(max(k, n_min), len(pool))
+        picked, picked_ids, anchor_keys = [], set(), set()
+
+        def max_sim(c):
+            if not picked:
+                return 0.0
+            return float(np.max(E[[p["sig_row"] for p in picked]] @ E[c["sig_row"]]))
+
+        def take(c):
+            picked.append(c)
+            picked_ids.add(id(c))
+
+        for i in range(n_min):                      # coverage anchors
+            w0, w1 = i * y, min((i + 1) * y, dur + 1e-6)
+            inwin = [c for c in pool if w0 <= c["timestamp_s"] < w1 and id(c) not in picked_ids]
+            if inwin:
+                fresh = [c for c in inwin if max_sim(c) <= dup]
+                best = max(fresh or inwin, key=lambda c: c["value"])
+                take(best)
+                anchor_keys.add(best["timestamp_s"])
+        for bk in (pool[0], pool[-1]):              # bookends
+            if id(bk) not in picked_ids and len(picked) < keff and max_sim(bk) <= dup:
+                take(bk)
+        steps = [(g, dup) for g in (0.5 * y, 0.33 * y, 0.2 * y, 0.0)] + [(0.0, 0.97), (0.0, 0.99), (0.0, 1.01)]
+        for min_gap, thr in steps:                  # MMR fill
+            while len(picked) < keff:
+                best, best_score = None, -1e18
+                for c in pool:
+                    if id(c) in picked_ids:
+                        continue
+                    if any(abs(c["timestamp_s"] - p["timestamp_s"]) < min_gap for p in picked):
+                        continue
+                    sim = max_sim(c)
+                    if sim > thr:
+                        continue
+                    score = c["value"] - lam * sim
+                    if score > best_score:
+                        best, best_score = c, score
+                if best is None:
+                    break
+                take(best)
+        picked.sort(key=lambda c: c["timestamp_s"])
+        return picked, anchor_keys
+
+    use_v3 = _sig is not None and all("sig_row" in c for c in gated)
+    if use_v3:
+        E = np.stack(sig_rows).astype(np.float32)
+        i_rank = _rank([c["inst_zs"] for c in gated])
+        b_rank = _rank([c["bad_zs"] for c in gated])
+        q_rank = _rank([c["value"] for c in gated])
+        for c, ir, br, qr in zip(gated, i_rank, b_rank, q_rank):
+            # Utility: image quality + instrument visible − obscured/blurry; the
+            # bottom 35% by quality is never preferred (glare-washed close-ups).
+            c["value_v15"] = c["value"]
+            c["value"] = c["value"] + 0.35 * float(ir) - 0.5 * float(br) - (1.0 if qr < 0.35 else 0.0)
+        selected, anchor_keys = _select_v3(gated, MAX_FRAMES, MAX_GAP_S, duration_s, E)
+        selector_version = "v3.1"
+        # v3.1 doesn't use DINOv2 phases, so its absence isn't a degradation here.
+        degrade_reasons[:] = [r for r in degrade_reasons if not r.startswith("DINOv2")]
+        if embs is None:  # persist SigLIP embeddings for re-select / analysis
+            embs = E[[c["sig_row"] for c in gated]]
+            emb_ts = [c["timestamp_s"] for c in gated]
+    else:
+        if _sig is not None:
+            degrade_reasons.append("SigLIP2 scores incomplete — v1.5 selector")
+        selected, anchor_keys = _select(gated, MAX_FRAMES, MAX_GAP_S, duration_s)
     sel_keys = {c["timestamp_s"] for c in selected}
     gaps = np.diff([0.0] + sorted(sel_keys) + [duration_s])
     print(f"[ingest] selected {len(selected)}/{len(gated)} (max_gap={gaps.max():.1f}s, "
@@ -580,7 +738,14 @@ try:
         yb = 0.5 * (r_ + g_) - b_
         colorf = math.sqrt(rg.std() ** 2 + yb.std() ** 2) + 0.3 * math.sqrt(rg.mean() ** 2 + yb.mean() ** 2)
         oob_flag, tissue_frac, edge_density, near_white_blue_frac, brightness_std = _is_oob_frame(rgb)
+        zs = {}
+        if _sig is not None:
+            try:
+                zs = _sig_scores([_sig_prep(rgb)])[1][0]
+            except Exception:
+                zs = {"oob_zs": 1e9}  # can't verify → re-gate fails, original frame kept
         return {
+            **zs,
             "frame_index": int(frame_idx),
             "timestamp_s": float(ts),
             "grad": _grad_of(g, M),

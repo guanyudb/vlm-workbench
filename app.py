@@ -4234,6 +4234,9 @@ def labels_stats():
 # them instantly without scanning the Volume.
 
 VIDEOS_INBOX_DIR = os.environ.get("VIDEOS_INBOX_DIR", f"{VOLUME_PATH}/videos/inbox")
+# SigLIP2 vision ONNX + text concepts for the v3.1 frame selector (built by
+# experiments/frame_selection_v3/export_onnx.py; ~355 MB, uploaded once).
+SIGLIP_MODEL_DIR = os.environ.get("SIGLIP_MODEL_DIR", f"{VOLUME_PATH}/local_models/siglip2_vlmwb_v1")
 IMAGES_INBOX_DIR = os.environ.get("IMAGES_INBOX_DIR", f"{VOLUME_PATH}/images")
 EXTRACTED_FRAMES_DIR_DEFAULT = os.environ.get(
     "EXTRACTED_FRAMES_DIR", EXTRACTED_FRAMES_DIR,
@@ -4932,6 +4935,9 @@ def kick_off_ingest(req: IngestRequest):
             "candidate_fps": req.candidate_fps,
             "max_frames": req.max_frames,
             "max_gap_seconds": req.max_gap_seconds,
+            # v3.1 selector: SigLIP2 vision ONNX + precomputed text concepts.
+            # Missing files make the notebook fall back to v1.5 (loudly).
+            "siglip_model_dir": SIGLIP_MODEL_DIR,
         }
         import yaml
         ingest_yaml = yaml.safe_dump(ingest_cfg, sort_keys=False, allow_unicode=True)
@@ -4984,7 +4990,8 @@ def kick_off_ingest(req: IngestRequest):
                 # (probed 2026-10-09: decord+cv2 decode at ~260 MB peak).
                 "spec": {
                     "environment_version": "5",
-                    "dependencies": ["decord==0.6.0", "opencv-python-headless==4.12.0.88", "psycopg[binary]"],
+                    "dependencies": ["decord==0.6.0", "opencv-python-headless==4.12.0.88", "psycopg[binary]",
+                                     "onnxruntime==1.22.1"],
                 },
             }],
             "performance_target": "PERFORMANCE_OPTIMIZED",
