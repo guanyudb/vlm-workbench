@@ -2480,7 +2480,7 @@ class FineTuneRequest(BaseModel):
     warmup_ratio: float = 0.03                              # NEW
     weight_decay: float = 0.0                               # NEW
     max_length: int = 1024                                  # NEW
-    accelerator: str = "GPU_8xH100"  # bigger model + bigger batch wants more GPUs
+    accelerator: str = "GPU_1xH100"  # single H100 is enough for LoRA on an 8B VLM
 
 
 @app.post("/api/training/finetune")
@@ -3541,6 +3541,19 @@ class SnapshotSummary(BaseModel):
 _SNAPSHOTS_TABLE_READY = False
 
 
+def _ddl_best_effort(cur, sql: str) -> None:
+    """Run idempotent DDL (CREATE INDEX / ALTER ... IF NOT EXISTS) that only
+    tidies an existing table. Postgres checks ownership BEFORE noticing the
+    object exists, so on a table created by another role (e.g. an earlier
+    deploy or a developer) these fail with InsufficientPrivilege even though
+    there is nothing to do — and that must not break reads/writes."""
+    import psycopg
+    try:
+        cur.execute(sql)
+    except psycopg.errors.InsufficientPrivilege as e:
+        log.info(f"skipping DDL on a table owned by another role ({e}): {sql.split(chr(10))[0][:80]}")
+
+
 def _ensure_snapshots_table():
     """Lazily create the snapshots table on first save. Idempotent."""
     global _SNAPSHOTS_TABLE_READY
@@ -3562,7 +3575,8 @@ def _ensure_snapshots_table():
                 created_at   timestamptz NOT NULL DEFAULT now()
             )
         """)
-        cur.execute(
+        _ddl_best_effort(
+            cur,
             "CREATE INDEX IF NOT EXISTS snapshots_created_at_idx "
             "ON snapshots (created_at DESC)"
         )

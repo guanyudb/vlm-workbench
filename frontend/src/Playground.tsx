@@ -118,7 +118,7 @@ export default function Playground({
   const [labels, setLabels] = useState<Map<string, FrameLabel>>(new Map());
 
   // ── selection state (persists across tab switch and page reload) ─────
-  const [frameSource, setFrameSource] = usePersistentState<FrameSource>("vlmwb.pg.frameSource", "eval");
+  const [frameSource, setFrameSource] = usePersistentState<FrameSource>("vlmwb.pg.frameSource", "extracted");
   const [videoFilter, setVideoFilter] = usePersistentState<string>("vlmwb.pg.videoFilter", "__all__");
   // Subsample interval in seconds (default 30). 0 = "show everything".
   const [intervalSec, setIntervalSec] = usePersistentState<number>("vlmwb.pg.intervalSec", 30);

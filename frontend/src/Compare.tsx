@@ -12,6 +12,25 @@ function frameBasename(p: string): string {
   return p.split("/").filter(Boolean).pop() || p;
 }
 
+/**
+ * Get the chosen label for a snapshot's frame.
+ * Returns the instrument from the best model if it has a row for this frame,
+ * else from the first model, or empty string if no result found.
+ */
+function getChosenLabel(
+  snap: SnapshotDetail,
+  fkey: string,
+  resultIndex: Record<string, Record<string, Record<string, RunResultRow>>>,
+): string {
+  const byModel = resultIndex[snap.id]?.[fkey] || {};
+  const best = snap.best_model && byModel[snap.best_model]
+    ? snap.best_model
+    : snap.model_names[0];
+  if (!best) return "";
+  const r = resultIndex[snap.id]?.[fkey]?.[best];
+  return r?.parsed ? extractInstrument(r.parsed) : "";
+}
+
 export default function Compare() {
   const [summaries, setSummaries] = useState<SnapshotSummary[]>([]);
   const [loadingList, setLoadingList] = useState(false);
@@ -122,6 +141,33 @@ export default function Compare() {
     selectedDetails.forEach((s) => s.frame_paths.forEach((p) => set.add(p)));
     return Array.from(set).sort();
   }, [selectedDetails]);
+
+  // Per-snapshot accuracy vs gold labels (over frames shown)
+  const accuracyBySnapshot = useMemo(() => {
+    if (selectedDetails.length === 0 || labels.size === 0) return null;
+    const framesToCount = commonFrames.length > 0 ? commonFrames : allFrames;
+    const result: Array<{ snap: SnapshotDetail; correct: number; total: number }> = [];
+
+    selectedDetails.forEach((snap) => {
+      let correct = 0;
+      let total = 0;
+      framesToCount.forEach((framePath) => {
+        const fkey = frameBasename(framePath);
+        const goldLabel = labels.get(framePath);
+        if (goldLabel?.instrument) {
+          total += 1;
+          const chosenLabel = getChosenLabel(snap, fkey, resultIndex);
+          if (chosenLabel === goldLabel.instrument) {
+            correct += 1;
+          }
+        }
+      });
+      if (total > 0) {
+        result.push({ snap, correct, total });
+      }
+    });
+    return result.length > 0 ? result : null;
+  }, [selectedDetails, commonFrames, allFrames, resultIndex, labels]);
 
   const togglePrompt = (id: string) => {
     setExpandedPrompts((cur) => {
@@ -292,6 +338,49 @@ export default function Compare() {
             </Card>
           )}
 
+          {accuracyBySnapshot && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">Accuracy vs gold labels</CardTitle>
+                <CardDescription>
+                  Per-snapshot accuracy over {commonFrames.length > 0 ? `${commonFrames.length} shared frames` : `${allFrames.length} frames`}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {accuracyBySnapshot.map(({ snap, correct, total }) => {
+                  const pct = ((correct / total) * 100).toFixed(0);
+                  const isHigh = correct / total >= 0.7;
+                  const isLow = correct / total < 0.5;
+                  return (
+                    <div
+                      key={snap.id}
+                      className="flex items-center justify-between rounded-md border bg-card/40 px-3 py-2 text-sm"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{snap.name}</span>
+                        <span className="text-muted-foreground">·</span>
+                        <span className="text-xs text-muted-foreground">{snap.best_model}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={cn(
+                            "font-mono text-sm font-semibold",
+                            isHigh ? "text-emerald-600 dark:text-emerald-400" : isLow ? "text-destructive" : "",
+                          )}
+                        >
+                          {pct}%
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          ({correct}/{total})
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </CardContent>
+            </Card>
+          )}
+
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-base">Per-frame predictions</CardTitle>
@@ -315,15 +404,9 @@ export default function Compare() {
                 .filter((framePath) => {
                   if (!hideAgreeing) return true;
                   const fkey = frameBasename(framePath);
-                  const allBestLabels = selectedDetails.map((snap) => {
-                    // Same choice as FrameRow: best model if it has a row for this frame, else the first model.
-                    const byModel = resultIndex[snap.id]?.[fkey] || {};
-                    const best = snap.best_model && byModel[snap.best_model]
-                      ? snap.best_model
-                      : snap.model_names[0];
-                    const r = best ? (resultIndex[snap.id]?.[fkey]?.[best]) : undefined;
-                    return r?.parsed ? extractInstrument(r.parsed) : "";
-                  });
+                  const allBestLabels = selectedDetails.map((snap) =>
+                    getChosenLabel(snap, fkey, resultIndex)
+                  );
                   const allPresent = allBestLabels.every((l) => l);
                   return allPresent && new Set(allBestLabels).size > 1;
                 })
@@ -368,13 +451,7 @@ function FrameRow({
   });
 
   // Distinct labels across all (best model from each snap) for the agreement chip
-  const bestLabels = perSnapshot.map(({ snap, rows }) => {
-    const best = snap.best_model && rows.find((r) => r.model === snap.best_model)?.row
-      ? snap.best_model
-      : rows[0]?.model;
-    const r = best ? (resultIndex[snap.id]?.[fkey]?.[best]) : undefined;
-    return r?.parsed ? extractInstrument(r.parsed) : "";
-  });
+  const bestLabels = snapshots.map((snap) => getChosenLabel(snap, fkey, resultIndex));
   const allBestPresent = bestLabels.every((l) => l);
   const allAgree = allBestPresent && new Set(bestLabels).size === 1;
 
