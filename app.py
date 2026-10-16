@@ -1700,7 +1700,11 @@ def _run_one(model_name: str, frame_name: str, frame_b64: str, prompt: str,
             #   OpenAI-style:    "response_format is not supported"
             #   Anthropic-style: "Response format type json_object is not
             #                     supported for this model." (fable-5)
-            if ("response_format" in msg or "response format" in msg) \
+            #   Newer Anthropic: "Structured output is not supported for this
+            #                     model because its translation requires
+            #                     forced tool use…" (opus-5-5)
+            if ("response_format" in msg or "response format" in msg
+                    or "structured output" in msg) \
                     and "response_format" in features:
                 return _chat_with_retries(features - {"response_format"}, attempts_left - 1)
             # temperature rejection — Anthropic reasoning models often
