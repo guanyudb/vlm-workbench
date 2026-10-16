@@ -2484,7 +2484,7 @@ class FineTuneRequest(BaseModel):
     warmup_ratio: float = 0.03                              # NEW
     weight_decay: float = 0.0                               # NEW
     max_length: int = 1024                                  # NEW
-    accelerator: str = "GPU_1xH100"  # single H100 is enough for LoRA on an 8B VLM
+    accelerator: str = "GPU_1xA10"  # 1xA10 fits LoRA on an 8B VLM (~8 min for 80 frames) and starts fast; H100 pools can queue
 
 
 @app.post("/api/training/finetune")

@@ -104,7 +104,7 @@ export default function Train() {
   const [warmupRatio, setWarmupRatio] = usePersistentState<number>("vlmwb.train.warmup", 0.03);
   const [weightDecay, setWeightDecay] = usePersistentState<number>("vlmwb.train.wd", 0.0);
   const [maxLength, setMaxLength] = usePersistentState<number>("vlmwb.train.maxLen", 1024);
-  const [accelerator, setAccelerator] = usePersistentState<string>("vlmwb.train.accel", "GPU_1xH100");
+  const [accelerator, setAccelerator] = usePersistentState<string>("vlmwb.train.accel", "GPU_1xA10");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   // Capacity preset → LoRA rank. Higher = more learnable params + more
   // overfit risk on small datasets. 16 is a reasonable middle for the
