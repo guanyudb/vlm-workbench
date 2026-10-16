@@ -32,9 +32,12 @@
 # MAGIC - ``<output_dir>/result.json`` — summary with run_id, UC name, accuracy on holdout, etc.
 
 # COMMAND ----------
-# MAGIC %pip install -q --upgrade "transformers>=4.57" "accelerate>=1.0" "peft>=0.13" \
-# MAGIC   "trl>=0.11" "datasets" "qwen-vl-utils" "pyyaml" mlflow pillow \
+# MAGIC %pip install -q --upgrade "transformers>=4.57,<5" "accelerate>=1.0,<2" "peft>=0.13,<1" \
+# MAGIC   "trl>=0.11,<1" "datasets" "qwen-vl-utils" "pyyaml" mlflow pillow \
 # MAGIC   safetensors tokenizers
+# MAGIC # Upper bounds: an unbounded --upgrade pulled transformers 5.x, which
+# MAGIC # removed TrainingArguments(warmup_ratio=...) and broke every fine-tune.
+# MAGIC # 4.57+ is the first line with Qwen3-VL support; stay below the next major.
 # MAGIC # NOTE: torch + torchvision come preinstalled in databricks_ai_v4 with
 # MAGIC # matching CUDA versions. We intentionally don't reinstall them; doing
 # MAGIC # so risks pulling a torchvision wheel for a different CUDA than the
@@ -273,14 +276,20 @@ val_ds = VLMFTDataset(val_rows, processor, TRAIN_PROMPT, MAX_LENGTH)
 # COMMAND ----------
 from transformers import TrainingArguments, Trainer
 
-training_args = TrainingArguments(
+# Integer warmup steps instead of `warmup_ratio`: transformers 5.x removed
+# `warmup_ratio`, and an integer `warmup_steps` means the same thing in
+# every version.
+import inspect, math
+_steps_per_epoch = max(1, math.ceil(len(train_rows) / max(1, BATCH_SIZE * GRAD_ACCUM)))
+_warmup_steps = int(round(WARMUP_RATIO * _steps_per_epoch * NUM_EPOCHS))
+_ta_kwargs = dict(
     output_dir=f"{OUTPUT_DIR}/checkpoints",
     num_train_epochs=NUM_EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=BATCH_SIZE,
     gradient_accumulation_steps=GRAD_ACCUM,
     learning_rate=LR,
-    warmup_ratio=WARMUP_RATIO,
+    warmup_steps=_warmup_steps,
     weight_decay=WEIGHT_DECAY,
     lr_scheduler_type="cosine",
     logging_steps=1,
@@ -295,6 +304,14 @@ training_args = TrainingArguments(
     remove_unused_columns=False,
     dataloader_pin_memory=False,
 )
+# Drop (loudly) any argument this transformers version no longer accepts,
+# so a library upgrade degrades a knob instead of failing the whole run.
+_ta_params = set(inspect.signature(TrainingArguments.__init__).parameters)
+_dropped = sorted(k for k in _ta_kwargs if k not in _ta_params)
+if _dropped:
+    print(f"[ft][warn] TrainingArguments in this transformers version ignores: {_dropped}")
+training_args = TrainingArguments(**{k: v for k, v in _ta_kwargs.items() if k in _ta_params})
+print(f"[ft] warmup_steps={_warmup_steps} ({WARMUP_RATIO:.0%} of {_steps_per_epoch * NUM_EPOCHS:.0f} optimizer steps)")
 
 # COMMAND ----------
 # MLflow tracking. The Workspace tracking URI lets us run, log, and register
