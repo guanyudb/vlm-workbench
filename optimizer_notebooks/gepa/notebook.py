@@ -139,9 +139,11 @@ TASK_MODEL = {
 # -- Reflector model: meta-optimizer; reads failures and proposes a new prompt --
 REFLECTOR_MODEL = {
     "provider": "databricks_fmapi",
-    "endpoint": "databricks-claude-sonnet-4-6",
-    "max_tokens": 1500,
-    "temperature": 0.4,
+    "endpoint": "databricks-claude-opus-5-5",
+    "max_tokens": 4000,
+    # Opus 5.5 rejects `temperature`; set a value here only for a reflector
+    # endpoint that accepts it.
+    "temperature": None,
 }
 
 # -- GEPA loop --
@@ -397,12 +399,22 @@ class ReflectorModel:
 
     def call(self, content_blocks):
         self.client.api_key = _fmapi_bearer(self.w)
-        resp = self.client.chat.completions.create(
+        kwargs = dict(
             model=self.cfg["endpoint"],
             messages=[{"role": "user", "content": content_blocks}],
             max_tokens=self.cfg["max_tokens"],
-            temperature=self.cfg["temperature"],
         )
+        if self.cfg.get("temperature") is not None:
+            kwargs["temperature"] = self.cfg["temperature"]
+        try:
+            resp = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            # Newer Anthropic models reject temperature outright.
+            msg = str(e).lower()
+            if "temperature" not in kwargs or "temperature" not in msg or "not support" not in msg:
+                raise
+            kwargs.pop("temperature")
+            resp = self.client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
 reflector = ReflectorModel(REFLECTOR_MODEL)

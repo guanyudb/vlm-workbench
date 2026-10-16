@@ -30,6 +30,7 @@ os.environ.setdefault("MLFLOW_TRACKING_URI", "databricks")
 os.environ.setdefault("MLFLOW_REGISTRY_URI", "databricks-uc")
 import re
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator, Dict, List, Optional
@@ -39,6 +40,18 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from PIL import Image
+
+# Imported eagerly even though most uses below re-import locally. Endpoints
+# run in a threadpool, and concurrent *first* imports of these packages (a
+# burst of page-load requests right after a deploy) can leave a half-built
+# `requests` in sys.modules; every SDK call then fails with "cannot import
+# name 'HTTPAdapter' from partially initialized module" until a restart.
+import requests  # noqa: E402,F401
+import databricks.sdk  # noqa: E402,F401
+import openai  # noqa: E402,F401
+import psycopg  # noqa: E402,F401
+import yaml  # noqa: E402,F401
+import mlflow  # noqa: E402,F401  (after the MLFLOW_* env defaults above)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vlm-workbench")
@@ -148,8 +161,7 @@ def _read_task_config() -> Dict[str, object]:
     if _task_config_cache is not None:
         return _task_config_cache
     try:
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
+        w = _workspace()
         with w.files.download(TASK_CONFIG_PATH).contents as f:
             data = json.loads(_drain_bytes(f).decode("utf-8"))
         # Backfill any missing top-level keys from the default (forward-compat
@@ -167,14 +179,13 @@ def _read_task_config() -> Dict[str, object]:
 def _write_task_config(cfg: Dict[str, object]) -> None:
     """Atomically write task_config.json to the Volume. Uses tmp + rename so
     a partial write can never be observed by a concurrent reader."""
-    from databricks.sdk import WorkspaceClient
     global _task_config_cache
     # Validate minimally — bad shape would silently break every tab
     if not isinstance(cfg.get("vocabulary"), list) or not cfg["vocabulary"]:
         raise ValueError("vocabulary must be a non-empty list")
     if not isinstance(cfg.get("prompt_template"), str) or not cfg["prompt_template"].strip():
         raise ValueError("prompt_template must be a non-empty string")
-    w = WorkspaceClient()
+    w = _workspace()
     cfg_dir = TASK_CONFIG_PATH.rsplit("/", 1)[0]
     try:
         w.files.create_directory(cfg_dir)
@@ -257,6 +268,7 @@ def _default_rendered_prompt() -> str:
 
 DEFAULT_PROMPT = _default_rendered_prompt()
 STUDIO_PER_FRAME_MODEL = os.environ.get("STUDIO_PER_FRAME_MODEL", "databricks-claude-sonnet-4-5")
+GEPA_REFLECTOR_MODEL = os.environ.get("GEPA_REFLECTOR_MODEL", "databricks-claude-opus-5-5")
 STUDIO_VALIDATOR_MODEL = os.environ.get("STUDIO_VALIDATOR_MODEL", "databricks-gpt-5-2")
 STUDIO_AUDIO_ENDPOINT = os.environ.get("STUDIO_AUDIO_ENDPOINT", "whisper-transcription")
 STUDIO_MAX_FRAMES = int(os.environ.get("STUDIO_MAX_FRAMES", "30"))
@@ -269,14 +281,32 @@ ALLOWED_PATH_PREFIXES = [
 
 # ── Lazy SDK clients ─────────────────────────────────────────────────────
 
+# The App SP's M2M creds, captured at import. _mlflow_auth_scope temporarily
+# swaps these env vars for a PAT, so anything that reads them later must use
+# these copies rather than os.environ.
+_SP_CLIENT_ID = os.environ.get("DATABRICKS_CLIENT_ID")
+_SP_CLIENT_SECRET = os.environ.get("DATABRICKS_CLIENT_SECRET")
+
 _w = None
+_w_lock = threading.Lock()
 
 
 def _workspace():
+    """Shared WorkspaceClient. When running as an App it's pinned to the SP's
+    OAuth creds with an explicit auth_type, so a DATABRICKS_TOKEN that shows
+    up in the env can't make it fail with "more than one authorization method
+    configured"."""
     global _w
     if _w is None:
-        from databricks.sdk import WorkspaceClient
-        _w = WorkspaceClient()
+        with _w_lock:
+            if _w is None:
+                from databricks.sdk import WorkspaceClient
+                if _SP_CLIENT_ID and _SP_CLIENT_SECRET:
+                    _w = WorkspaceClient(client_id=_SP_CLIENT_ID,
+                                         client_secret=_SP_CLIENT_SECRET,
+                                         auth_type="oauth-m2m")
+                else:
+                    _w = WorkspaceClient()
     return _w
 
 
@@ -330,8 +360,8 @@ def _lakebase_token() -> Optional[str]:
     now = time.time()
     if _token_cache["token"] and float(_token_cache["expires_at"]) > now + 60:
         return str(_token_cache["token"])
-    client_id = os.environ.get("DATABRICKS_CLIENT_ID")
-    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET")
+    client_id = _SP_CLIENT_ID
+    client_secret = _SP_CLIENT_SECRET
     host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
     if client_id and client_secret and host:
         host_no_scheme = host.replace("https://", "").replace("http://", "")
@@ -366,7 +396,7 @@ def _pg_user() -> Optional[str]:
     # Lakebase Postgres role name. The Apps `postgres:` binding auto-injects
     # PGUSER = the SP's client_id (UUID). For PAT-based local dev, fall back
     # to the workspace user email (which the personal Lakebase role uses).
-    return os.environ.get("PGUSER") or os.environ.get("DATABRICKS_CLIENT_ID") or _ws_user_email()
+    return os.environ.get("PGUSER") or _SP_CLIENT_ID or _ws_user_email()
 
 
 def _ws_user_email() -> Optional[str]:
@@ -394,7 +424,7 @@ def _lakebase_available() -> bool:
     """Lakebase is available iff we have credentials capable of producing a
     Postgres password (either the SP's M2M creds, a PGPASSWORD, or a PAT)."""
     return bool(
-        os.environ.get("DATABRICKS_CLIENT_ID")
+        _SP_CLIENT_ID
         or os.environ.get("PGPASSWORD")
         or os.environ.get("DATABRICKS_TOKEN")
     )
@@ -481,8 +511,7 @@ def _get_active_ingest_runs() -> Optional[Dict[str, Dict[str, object]]]:
     if _active_runs_cache.get("runs") is not None and float(_active_runs_cache.get("expires_at", 0)) > now:
         return dict(_active_runs_cache["runs"])  # return a copy
 
-    from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient()
+    w = _workspace()
     active_by_video: Dict[str, Dict[str, object]] = {}
     try:
         # active_only covers every non-terminal state; the explicit set below
@@ -522,9 +551,8 @@ def _run_failure_detail(run_id: str) -> Optional[str]:
     if run_id in _failure_detail_cache:
         return _failure_detail_cache[run_id]
 
-    from databricks.sdk import WorkspaceClient
     try:
-        w = WorkspaceClient()
+        w = _workspace()
         resp = w.api_client.do("GET", f"/api/2.1/jobs/runs/get?run_id={run_id}")
         if not str(resp.get("run_name") or "").startswith("vlmwb_"):
             return None  # never surface another job's error trace
@@ -565,11 +593,10 @@ def list_runs():
     runs from other workspace users. The SDK doesn't expose a
     `run_as_user_name` filter at this version, so name-prefix filtering
     is the only practical guard in a shared workspace."""
-    from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient()
+    w = _workspace()
     since = int((time.time() - 24 * 3600) * 1000)
     host = (os.environ.get("DATABRICKS_HOST") or "").rstrip("/")
-    sp = os.environ.get("DATABRICKS_CLIENT_ID") or ""
+    sp = _SP_CLIENT_ID or ""
     out: List[Dict[str, object]] = []
     try:
         # limit=25 is the Jobs API per-page cap; iterator paginates as needed.
@@ -613,8 +640,7 @@ class CancelRunRequest(BaseModel):
 def cancel_run(req: CancelRunRequest):
     """Cancel a Databricks job run. Only allows canceling runs whose run_name
     starts with 'vlmwb_' (workbench-submitted runs)."""
-    from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient()
+    w = _workspace()
     try:
         run = w.jobs.get_run(req.databricks_run_id)
         run_name = run.run_name or ""
@@ -731,8 +757,7 @@ def store_hf_token(req: HFTokenIn):
     if not scope or not key:
         raise HTTPException(503, "HF scope/key not configured — set hf_secret_scope and hf_secret_key in variable-overrides.json")
 
-    from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient()
+    w = _workspace()
 
     # Ensure scope exists. If the deployer pre-owns it, we just put. If it
     # doesn't exist yet, App SP creates it (and becomes owner — so the
@@ -1095,7 +1120,7 @@ def setup_check():
                 f"Click 'Set token in-app' below to paste a token."
             )
         # Probe ACL — we want to know if SP has READ
-        sp = os.environ.get("DATABRICKS_CLIENT_ID")
+        sp = _SP_CLIENT_ID
         detail = f"scope `{target_scope}` · key `{target_key}` present"
         if sp:
             try:
@@ -1788,7 +1813,7 @@ async def playground_run(req: PlaygroundRequest):
 # ── Prompt optimization (kicks off GEPA/DSPy notebook as a Databricks Job) ──
 
 def _sp_home() -> str:
-    sp_id = os.environ.get("DATABRICKS_CLIENT_ID")
+    sp_id = _SP_CLIENT_ID
     if not sp_id:
         raise RuntimeError("DATABRICKS_CLIENT_ID not set; cannot resolve SP home")
     return f"/Workspace/Users/{sp_id}"
@@ -1828,9 +1853,8 @@ def _resolve_optimizer_notebook(kind: str) -> str:
     with open(src_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
 
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.workspace import ImportFormat, Language
-    w = WorkspaceClient()
+    w = _workspace()
     target_dir = f"{_sp_home()}/optimizer_notebooks/{kind}"
     target_path = f"{target_dir}/notebook"
     w.workspace.mkdirs(target_dir)
@@ -1871,9 +1895,8 @@ def _resolve_local_inference_notebook() -> str:
         raise RuntimeError(f"local inference notebook missing in {base_dir}")
     with open(src_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.workspace import ImportFormat, Language
-    w = WorkspaceClient()
+    w = _workspace()
     target_dir = f"{_sp_home()}/local_inference_notebooks/run"
     target_path = f"{target_dir}/notebook"
     w.workspace.mkdirs(target_dir)
@@ -1914,9 +1937,8 @@ def _resolve_local_inference_notebook_variant(variant: str) -> str:
         return _resolve_local_inference_notebook()
     with open(src_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.workspace import ImportFormat, Language
-    w = WorkspaceClient()
+    w = _workspace()
     target_dir = f"{_sp_home()}/local_inference_notebooks/{variant}"
     target_path = f"{target_dir}/notebook"
     w.workspace.mkdirs(target_dir)
@@ -2154,7 +2176,7 @@ def _default_mlflow_experiment_path() -> str:
     """Place the experiment under the SP's own workspace home — that's the
     one path we're guaranteed CAN_MANAGE on. Putting it under the human
     user's home requires ACL grants that aren't reliably in place."""
-    sp = os.environ.get("DATABRICKS_CLIENT_ID")
+    sp = _SP_CLIENT_ID
     if sp:
         return f"/Users/{sp}/vlmwb-experiments"
     return "/Shared/vlmwb-experiments"
@@ -2182,9 +2204,8 @@ def _resolve_finetune_notebook() -> str:
         raise RuntimeError(f"finetune notebook missing in {base_dir}")
     with open(src_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.workspace import ImportFormat, Language
-    w = WorkspaceClient()
+    w = _workspace()
     target_dir = f"{_sp_home()}/local_inference_notebooks/finetune"
     target_path = f"{target_dir}/notebook"
     w.workspace.mkdirs(target_dir)
@@ -2858,7 +2879,6 @@ def create_serving_endpoint(req: DeployRequest):
     """Create a serving endpoint from a UC-registered model. Returns
     immediately; poll /api/deploy/endpoints/{name} until state=READY."""
     import re
-    from databricks.sdk import WorkspaceClient
 
     # Validate model name format to prevent injection
     model_name = _safe_uc_name(req.model_full_name)
@@ -3087,9 +3107,8 @@ def _resolve_repin_notebook() -> str:
         raise RuntimeError(f"repin notebook missing in {base_dir}")
     with open(src_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.workspace import ImportFormat, Language
-    w = WorkspaceClient()
+    w = _workspace()
     target_dir = f"{_sp_home()}/local_inference_notebooks/repin"
     target_path = f"{target_dir}/notebook"
     w.workspace.mkdirs(target_dir)
@@ -3333,8 +3352,9 @@ def kick_off_optimize(req: OptimizeRequest):
     if req.optimizer == "gepa":
         cfg["reflector_model"] = {
             "provider": "databricks_fmapi",
-            "endpoint": "databricks-claude-sonnet-4-6",
-            "max_tokens": 1500, "temperature": 0.4,
+            "endpoint": GEPA_REFLECTOR_MODEL,
+            # Opus 5.5 rejects `temperature`, so none is sent.
+            "max_tokens": 4000, "temperature": None,
         }
         cfg["optimizer"] = {
             "n_rounds": req.n_rounds,
@@ -4092,7 +4112,16 @@ class _mlflow_auth_scope:
     "set MLFLOW_ENABLE_DB_SDK to true" even with the flag set (some
     string-check quirk we couldn't satisfy). Using a PAT sidesteps the
     flag entirely, but globally setting DATABRICKS_TOKEN breaks every other
-    SDK consumer in the app. So: scope it."""
+    SDK consumer in the app. So: scope it.
+
+    os.environ is process-global and endpoints run in a threadpool, so scopes
+    are serialized. Without the lock, two overlapping scopes (e.g. Setup's
+    checks + a prompt-registry call) restored each other's saved values and
+    left DATABRICKS_TOKEN set next to the OAuth creds until the app restarted.
+    Code outside the scope uses _workspace() / _SP_CLIENT_ID, which don't read
+    the swapped vars."""
+    _lock = threading.RLock()
+
     def __init__(self):
         self._saved_id = None
         self._saved_secret = None
@@ -4100,7 +4129,12 @@ class _mlflow_auth_scope:
         self._set = False
 
     def __enter__(self):
-        tok = _lakebase_token()
+        self._lock.acquire()
+        try:
+            tok = _lakebase_token()
+        except BaseException:
+            self._lock.release()
+            raise
         if not tok:
             return self
         self._saved_id = os.environ.pop("DATABRICKS_CLIENT_ID", None)
@@ -4111,16 +4145,19 @@ class _mlflow_auth_scope:
         return self
 
     def __exit__(self, *_):
-        if not self._set:
-            return
-        if self._saved_id is not None:
-            os.environ["DATABRICKS_CLIENT_ID"] = self._saved_id
-        if self._saved_secret is not None:
-            os.environ["DATABRICKS_CLIENT_SECRET"] = self._saved_secret
-        if self._saved_token is None:
-            os.environ.pop("DATABRICKS_TOKEN", None)
-        else:
-            os.environ["DATABRICKS_TOKEN"] = self._saved_token
+        try:
+            if not self._set:
+                return
+            if self._saved_id is not None:
+                os.environ["DATABRICKS_CLIENT_ID"] = self._saved_id
+            if self._saved_secret is not None:
+                os.environ["DATABRICKS_CLIENT_SECRET"] = self._saved_secret
+            if self._saved_token is None:
+                os.environ.pop("DATABRICKS_TOKEN", None)
+            else:
+                os.environ["DATABRICKS_TOKEN"] = self._saved_token
+        finally:
+            self._lock.release()
 
 
 def _register_genai_prompt(template: str, commit_message: str,
@@ -4383,9 +4420,8 @@ def _resolve_ingest_notebook() -> str:
         raise RuntimeError(f"ingest notebook missing in {base_dir}")
     with open(src_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.workspace import ImportFormat, Language
-    w = WorkspaceClient()
+    w = _workspace()
     target_dir = f"{_sp_home()}/ingest_notebooks/smart_frames"
     target_path = f"{target_dir}/notebook"
     w.workspace.mkdirs(target_dir)
@@ -4416,9 +4452,8 @@ def _resolve_setup_cache_notebook() -> str:
         raise RuntimeError(f"setup_cache notebook missing in {base_dir}")
     with open(src_path, "rb") as f:
         content_b64 = base64.b64encode(f.read()).decode("ascii")
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.workspace import ImportFormat, Language
-    w = WorkspaceClient()
+    w = _workspace()
     target_dir = f"{_sp_home()}/local_inference_notebooks/setup_cache"
     target_path = f"{target_dir}/notebook"
     w.workspace.mkdirs(target_dir)
@@ -4655,7 +4690,6 @@ async def library_upload(
     so they land in the same subfolder.
     Multi-file uploads from the browser issue this endpoint once per file."""
     import hashlib
-    from databricks.sdk import WorkspaceClient
 
     fname = _safe_basename(file.filename or "upload")
     ext = os.path.splitext(fname)[1].lower()
@@ -4715,7 +4749,7 @@ async def library_upload(
             raise HTTPException(400, "empty upload")
         spool.seek(0)
 
-        w = WorkspaceClient()
+        w = _workspace()
         try:
             w.files.create_directory(dest_dir)
         except Exception:
@@ -5238,7 +5272,6 @@ def delete_video_index(video_id: str):
 
 import hashlib
 import shutil
-import threading
 
 # Per-replica disk cache so Range requests (every seek in the player) read a
 # local file instead of re-downloading the whole video from the Volume.
